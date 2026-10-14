@@ -6,7 +6,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	appconstant "github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
+	"github.com/tidwall/sjson"
 )
 
 type Adaptor struct {
@@ -239,7 +244,43 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
-	return channel.DoApiRequest(a, c, info, requestBody)
+	// Check the final body, including passthrough and parameter overrides.
+	// Public cache names must never reach Google, and raw upstream names must
+	// never bypass the owner's resource binding on another input protocol.
+	record, bound := common.GetContextKeyType[*model.GeminiCachedContent](c, appconstant.ContextKeyGeminiCachedContent)
+	nativeCache := false
+	if request, ok := info.Request.(*dto.GeminiChatRequest); ok {
+		nativeCache = request.CachedContent != ""
+	}
+	passthrough := info.ChannelSetting.PassThroughBodyEnabled || model_setting.GetGlobalSettings().PassThroughRequestEnabled
+	if !bound && !nativeCache && len(info.ParamOverride) == 0 && (!passthrough || info.RelayFormat == types.RelayFormatGemini) {
+		return channel.DoApiRequest(a, c, info, requestBody)
+	}
+	body, err := io.ReadAll(requestBody)
+	if err != nil {
+		return nil, err
+	}
+	if bound || service.HasGeminiCacheReference(body) {
+		name, validationErr := service.ValidateGeminiCacheReference(body)
+		if validationErr != nil {
+			return nil, validationErr
+		}
+		if !bound || record == nil || name != "cachedContents/"+record.PublicID || info.UpstreamModelName != record.UpstreamModel ||
+			info.ChannelId != record.ChannelID || service.GeminiCacheKeyFingerprint(info.ApiKey) != record.KeyFingerprint || record.ExpiresAt <= time.Now().Unix() {
+			return nil, errors.New("CachedContent not found (or permission denied)")
+		}
+		body, err = sjson.SetBytes(body, "cachedContent", record.UpstreamName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	outbound, closer, err := relaycommon.NewOutboundJSONBody(body)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	body = nil
+	return channel.DoApiRequest(a, c, info, outbound)
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {

@@ -12,14 +12,16 @@ import (
 )
 
 type ChannelSettings struct {
-	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
-	ForceFormat               bool   `json:"force_format,omitempty"`
-	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
-	Proxy                     string `json:"proxy"`
-	PassThroughBodyEnabled    bool   `json:"pass_through_body_enabled,omitempty"`
-	ResponsesWebSocketEnabled bool   `json:"responses_websocket_enabled,omitempty"`
-	SystemPrompt              string `json:"system_prompt,omitempty"`
-	SystemPromptOverride      bool   `json:"system_prompt_override,omitempty"`
+	// GeminiExplicitCacheEnabled opts a non-Google Gemini endpoint into explicit cache management.
+	GeminiExplicitCacheEnabled bool   `json:"gemini_explicit_cache_enabled,omitempty"`
+	TaskPluginKey              string `json:"task_plugin_key,omitempty"`
+	ForceFormat                bool   `json:"force_format,omitempty"`
+	ThinkingToContent          bool   `json:"thinking_to_content,omitempty"`
+	Proxy                      string `json:"proxy"`
+	PassThroughBodyEnabled     bool   `json:"pass_through_body_enabled,omitempty"`
+	ResponsesWebSocketEnabled  bool   `json:"responses_websocket_enabled,omitempty"`
+	SystemPrompt               string `json:"system_prompt,omitempty"`
+	SystemPromptOverride       bool   `json:"system_prompt_override,omitempty"`
 	// TaskExtendPluginKeys lists the task plugins a New API channel (type 60)
 	// is extended with. The upstream gateway may host many plugins, so the
 	// channel serves every listed plugin's models while the request still pins

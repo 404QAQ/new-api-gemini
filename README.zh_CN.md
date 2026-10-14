@@ -1,3 +1,11 @@
+## Gemini 显式缓存扩展
+
+本仓库基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，增加 Gemini 缓存创建、查询、列表、续期、删除，以及原生普通/流式请求的缓存引用，包含令牌隔离、渠道与密钥绑定、独立计费。
+
+**[使用说明、价格配置与调用示例](./GEMINI_CACHE.md)** · [上游项目](https://github.com/QuantumNous/new-api) · [AGPL-3.0 许可](./LICENSE)
+
+这是社区扩展版本。已完成模拟上游、三数据库和本地构建验证；尚未通过真实 Google API 验证。使用前需要配置缓存价格，结果不明确的计费操作需要人工对账。原项目说明与归属保留如下。
+
 <div align="center">
 
 ![new-api](/web/public/logo.png)

@@ -1,18 +1,30 @@
 package router
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
@@ -89,6 +101,61 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	}
 }
 
+func TestGeminiCachedContentRoutesRequireToken(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, model.DB.AutoMigrate(&model.GeminiCachedContent{}))
+	user := model.User{Username: "cache-owner", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "cachetestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+	engine := gin.New()
+	SetRelayRouter(engine)
+	for _, header := range []string{"Authorization", "x-goog-api-key", "query", ""} {
+		t.Run(header, func(t *testing.T) {
+			path := "/v1beta/cachedContents"
+			if header == "query" {
+				path += "?key=cachetestkey"
+			}
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			if header == "Authorization" {
+				request.Header.Set(header, "Bearer cachetestkey")
+			} else if header == "x-goog-api-key" {
+				request.Header.Set(header, "cachetestkey")
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if header == "" {
+				assert.Equal(t, http.StatusUnauthorized, response.Code)
+			} else {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.JSONEq(t, `{"cachedContents":[]}`, response.Body.String())
+			}
+		})
+	}
+	limitEngine := gin.New()
+	limitEngine.Use(func(c *gin.Context) { c.Set(common.KeyBodyStorage, oversizedGeminiCacheBody{}) })
+	SetRelayRouter(limitEngine)
+	for _, method := range []string{http.MethodPost, http.MethodPatch} {
+		path := "/v1beta/cachedContents"
+		if method == http.MethodPatch {
+			path += "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}
+		request := httptest.NewRequest(method, path, nil)
+		request.Header.Set("x-goog-api-key", "cachetestkey")
+		response := httptest.NewRecorder()
+		limitEngine.ServeHTTP(response, request)
+		assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code, response.Body.String())
+	}
+}
+
+// Embedding intentionally leaves Bytes unimplemented: a rejected body must
+// never be read in full, even if its storage was previously spooled to disk.
+type oversizedGeminiCacheBody struct{ common.BodyStorage }
+
+func (oversizedGeminiCacheBody) Size() int64                    { return service.GeminiCacheMaxRequestBytes + 1 }
+func (oversizedGeminiCacheBody) Seek(int64, int) (int64, error) { return 0, nil }
+func (oversizedGeminiCacheBody) Close() error                   { return nil }
+
 func setupRelayRouterTestDB(t *testing.T) {
 	t.Helper()
 
@@ -123,4 +190,383 @@ func setupRelayRouterTestDB(t *testing.T) {
 			require.NoError(t, os.Unsetenv("SQL_DSN"))
 		}
 	})
+}
+
+func TestGeminiCacheLifecycle(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.GeminiCachedContent{}, &model.Log{}))
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+	previousMemory, previousBatch, previousLogs := common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
+	common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousMemory, previousBatch, previousLogs
+	})
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousSettings := *settings
+	t.Cleanup(func() { *settings = previousSettings })
+	// Refunds enqueue cache updates after the database refund. Drain those
+	// workers before restoring globals or closing this fixture's database.
+	t.Cleanup(func() {
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
+	})
+	settings.BillingMode = map[string]string{"gemini-2.5-flash": billing_setting.BillingModeTieredExpr, "gemini-2.5-flash-cache-create": billing_setting.BillingModeTieredExpr, "gemini-2.5-flash-cache-storage": billing_setting.BillingModeTieredExpr}
+	settings.BillingExpr = map[string]string{"gemini-2.5-flash": `tier("generation",p*0.3+c*2.5)`, "gemini-2.5-flash-cache-create": `tier("cache",p*0.3+p*(param("cache_storage_hours")??0))`, "gemini-2.5-flash-cache-storage": `tier("storage",p*(param("cache_storage_hours")??0))`}
+	service.InitHttpClient()
+	var mu sync.Mutex
+	var upstreamExpiry string
+	cacheTotalTokens := 2048
+	var cleanupObserved atomic.Bool
+	var failedStateCommit atomic.Int32
+	var uncertainCreate atomic.Int32
+	var rejectDelete atomic.Bool
+	var failedRollback atomic.Bool
+	var patchAttempts atomic.Int32
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPatch && failedStateCommit.Load() == 2 {
+			cleanupObserved.Store(true)
+		}
+		assert.Equal(t, "upstream-original", r.Header.Get("x-goog-api-key"))
+		raw, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		var body map[string]any
+		if len(raw) > 0 {
+			require.NoError(t, common.Unmarshal(raw, &body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete && rejectDelete.Load() {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if r.Method == http.MethodPatch && failedRollback.Load() && patchAttempts.Add(1) > 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if (r.Method == http.MethodDelete && uncertainCreate.Load() != 0) ||
+			(r.Method == http.MethodPost && r.URL.Path == "/v1beta/cachedContents" && uncertainCreate.Load() == 2) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":countTokens"):
+			_, _ = w.Write([]byte(`{"totalTokens":2048}`))
+		case r.Method == http.MethodDelete:
+			cleanupObserved.Store(true)
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, ":generateContent"), strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
+			assert.Equal(t, "cachedContents/private-upstream", body["cachedContent"])
+			response := `{"candidates":[{"content":{"role":"model","parts":[{"text":"cached answer"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":2058,"candidatesTokenCount":3,"totalTokenCount":2061,"cachedContentTokenCount":2048},"modelVersion":"gemini-2.5-flash"}`
+			if strings.HasSuffix(r.URL.Path, ":streamGenerateContent") {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", response)
+			} else {
+				_, _ = w.Write([]byte(response))
+			}
+		default:
+			if value, ok := body["expireTime"].(string); ok {
+				upstreamExpiry = value
+			}
+			response, err := common.Marshal(map[string]any{"name": "cachedContents/private-upstream", "model": "models/gemini-2.5-flash", "expireTime": upstreamExpiry, "usageMetadata": map[string]any{"totalTokenCount": cacheTotalTokens}})
+			require.NoError(t, err)
+			_, _ = w.Write(response)
+		}
+	}))
+	defer server.Close()
+	user := model.User{Username: "cache-lifecycle", AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000000, Setting: `{"billing_preference":"wallet_only"}`}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "cachelifecyclekey", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000, Group: "default"}
+	require.NoError(t, model.DB.Create(&token).Error)
+	otherToken := model.Token{UserId: user.Id, Key: "cacheotherkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000, Group: "default"}
+	require.NoError(t, model.DB.Create(&otherToken).Error)
+	channel := model.Channel{Type: constant.ChannelTypeGemini, Status: common.ChannelStatusEnabled, Key: "upstream-original\nupstream-disabled", Name: "cache lifecycle", Models: "gemini-2.5-flash", Group: "default", BaseURL: &server.URL, Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true}`), ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{1: 2}}}
+	require.NoError(t, channel.Insert())
+	unsupported := model.Channel{Type: constant.ChannelTypeGemini, Status: common.ChannelStatusEnabled, Key: "unused", Name: "higher priority without cache support", Models: "gemini-2.5-flash", Group: "default", BaseURL: common.GetPointer("https://cache-disabled.invalid"), Priority: common.GetPointer(int64(100))}
+	require.NoError(t, unsupported.Insert())
+	engine := gin.New()
+	SetRelayRouter(engine)
+	doRequest := func(method, path, body, key string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+key)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	createBody := `{"model":"models/gemini-2.5-flash","ttl":"3600s","contents":[{"role":"user","parts":[{"text":"cached source"}]}]}`
+	configuredPrice := settings.BillingExpr["gemini-2.5-flash-cache-create"]
+	delete(settings.BillingExpr, "gemini-2.5-flash-cache-create")
+	missingPrice := doRequest(http.MethodPost, "/v1beta/cachedContents", createBody, token.Key)
+	require.NotEqual(t, http.StatusOK, missingPrice.Code)
+	mu.Lock()
+	assert.Empty(t, calls, "missing cache price must prevent even countTokens")
+	mu.Unlock()
+	settings.BillingExpr["gemini-2.5-flash-cache-create"] = configuredPrice
+	response := doRequest(http.MethodPost, "/v1beta/cachedContents", `{"model":"models/gemini-2.5-flash","ttl":"3600s","contents":[{"role":"user","parts":[{"text":"a sufficiently large cached source"}]}]}`, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var resource map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &resource))
+	name, ok := resource["name"].(string)
+	require.True(t, ok)
+	assert.NotEqual(t, "cachedContents/private-upstream", name)
+	require.NotContains(t, response.Body.String(), "private-upstream")
+	var binding model.GeminiCachedContent
+	require.NoError(t, model.DB.Where("public_id = ?", strings.TrimPrefix(name, "cachedContents/")).First(&binding).Error)
+	assert.Equal(t, model.GeminiCachedContentActive, binding.State)
+	assert.Equal(t, service.GeminiCacheKeyFingerprint("upstream-original"), binding.KeyFingerprint)
+	var afterCreate model.User
+	require.NoError(t, model.DB.First(&afterCreate, user.Id).Error)
+	assert.Less(t, afterCreate.Quota, user.Quota)
+	response = doRequest(http.MethodGet, "/v1beta/"+name, "", token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	response = doRequest(http.MethodGet, "/v1beta/cachedContents", "", token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), name)
+	response = doRequest(http.MethodGet, "/v1beta/"+name, "", otherToken.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.Model(&token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "gemini-2.5-pro"}).Error)
+	response = doRequest(http.MethodGet, "/v1beta/"+name, "", token.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.Model(&token).Updates(map[string]any{"model_limits_enabled": false, "model_limits": ""}).Error)
+	require.NoError(t, model.DB.Model(&binding).Update("group", "other-group").Error)
+	response = doRequest(http.MethodGet, "/v1beta/"+name, "", token.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.Model(&binding).Update("group", "default").Error)
+
+	// Reordering credentials must keep the same upstream account and update its index.
+	channel.Key = "upstream-disabled\nupstream-original"
+	channel.ChannelInfo.MultiKeyStatusList = map[int]int{0: 2}
+	require.NoError(t, model.DB.Save(&channel).Error)
+	generateBody := `{"cachedContent":"` + name + `","contents":[{"role":"user","parts":[{"text":"summarize"}]}]}`
+	for _, action := range []string{"generateContent", "streamGenerateContent"} {
+		response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:"+action, generateBody, token.Key)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "cached answer")
+	}
+	response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", generateBody, token.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", generateBody, otherToken.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	mu.Lock()
+	beforeRejected := len(calls)
+	mu.Unlock()
+	channel.ModelMapping = common.GetPointer(`{"gemini-2.5-flash":"gemini-2.5-pro"}`)
+	require.NoError(t, model.DB.Save(&channel).Error)
+	response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", generateBody, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code)
+	channel.ModelMapping = nil
+	require.NoError(t, model.DB.Save(&channel).Error)
+	originalExpiry := binding.ExpiresAt
+	require.NoError(t, model.DB.Model(&binding).Update("expires_at", time.Now().Add(-time.Second).Unix()).Error)
+	response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", generateBody, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.Model(&binding).Update("expires_at", originalExpiry).Error)
+	mu.Lock()
+	assert.Len(t, calls, beforeRejected, "expired resources and mapping drift must not reach upstream")
+	mu.Unlock()
+	response = doRequest(http.MethodPatch, "/v1beta/"+name+"?updateMask=ttl", `{"ttl":"7200s"}`, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, model.DB.First(&binding, binding.ID).Error)
+	assert.Equal(t, model.GeminiCachedContentActive, binding.State)
+	assert.Greater(t, binding.PaidUntil, time.Now().Add(time.Hour).Unix())
+	var afterExtend model.User
+	require.NoError(t, model.DB.First(&afterExtend, user.Id).Error)
+	response = doRequest(http.MethodPatch, "/v1beta/"+name, `{"ttl":"3600s"}`, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var afterShrink model.User
+	require.NoError(t, model.DB.First(&afterShrink, user.Id).Error)
+	assert.Equal(t, afterExtend.Quota, afterShrink.Quota)
+	paidExpiry := time.Unix(binding.PaidUntil, 0).UTC().Format(time.RFC3339)
+	response = doRequest(http.MethodPatch, "/v1beta/"+name, `{"expireTime":"`+paidExpiry+`"}`, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var afterRestore model.User
+	require.NoError(t, model.DB.First(&afterRestore, user.Id).Error)
+	assert.Equal(t, afterShrink.Quota, afterRestore.Quota, "restoring previously paid storage must not charge twice")
+
+	rejectDelete.Store(true)
+	response = doRequest(http.MethodDelete, "/v1beta/"+name, "", token.Key)
+	require.Equal(t, http.StatusTooManyRequests, response.Code)
+	require.NoError(t, model.DB.First(&binding, binding.ID).Error)
+	assert.Equal(t, model.GeminiCachedContentActive, binding.State, "a definite rejection must release the mutation lease")
+	rejectDelete.Store(false)
+	response = doRequest(http.MethodDelete, "/v1beta/"+name, "", token.Key)
+	require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, response.Code, response.Body.String())
+	response = doRequest(http.MethodGet, "/v1beta/"+name, "", token.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	response = doRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", generateBody, token.Key)
+	assert.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.First(&binding, binding.ID).Error)
+	assert.Equal(t, model.GeminiCachedContentDeleted, binding.State)
+	var logs []model.Log
+	require.NoError(t, model.DB.Where("user_id = ?", user.Id).Find(&logs).Error)
+	assert.GreaterOrEqual(t, len(logs), 4)
+	mu.Lock()
+	assert.Contains(t, calls, "POST /v1beta/cachedContents")
+	assert.Contains(t, calls, "DELETE /v1beta/cachedContents/private-upstream")
+	mu.Unlock()
+	// An upstream count exceeding countTokens must reserve the difference before
+	// activation. If the wallet cannot fund it, delete the upstream cache and refund.
+	require.NoError(t, model.DB.Model(&user).Update("quota", 2000).Error)
+	require.NoError(t, model.DB.Model(&token).Update("remain_quota", 2000).Error)
+	mu.Lock()
+	cacheTotalTokens = 1_000_000
+	mu.Unlock()
+	cleanupObserved.Store(false)
+	refunded := make(chan struct{}, 1)
+	const callback = "gemini_cache_lifecycle_refund"
+	require.NoError(t, model.DB.Callback().Update().After("gorm:commit_or_rollback_transaction").Register(callback, func(tx *gorm.DB) {
+		if cleanupObserved.Load() && tx.Statement.Table == "tokens" && tx.Error == nil {
+			select {
+			case refunded <- struct{}{}:
+			default:
+			}
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
+	response = doRequest(http.MethodPost, "/v1beta/cachedContents", createBody, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code, response.Body.String())
+	require.True(t, cleanupObserved.Load(), "failed supplemental reservation must delete the cache")
+	select {
+	case <-refunded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cache refund did not finish")
+	}
+	var refundedUser model.User
+	var refundedToken model.Token
+	require.NoError(t, model.DB.First(&refundedUser, user.Id).Error)
+	require.NoError(t, model.DB.First(&refundedToken, token.Id).Error)
+	assert.Equal(t, 2000, refundedUser.Quota)
+	assert.Equal(t, 2000, refundedToken.RemainQuota)
+	var active int64
+	require.NoError(t, model.DB.Model(&model.GeminiCachedContent{}).Where("state = ?", model.GeminiCachedContentActive).Count(&active).Error)
+	assert.Zero(t, active)
+	const stateCallback = "gemini_cache_lifecycle_state_failure"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(stateCallback, func(tx *gorm.DB) {
+		if tx.Statement.Table != "gemini_cached_contents" {
+			return
+		}
+		values, ok := tx.Statement.Dest.(map[string]any)
+		if !ok || values["state"] != model.GeminiCachedContentActive {
+			return
+		}
+		_, activates := values["upstream_name"]
+		_, finishes := values["expires_at"]
+		mode := failedStateCommit.Load()
+		if (mode == 1 && activates) || (mode == 2 && finishes && !activates) {
+			tx.AddError(errors.New("injected cached content state commit failure"))
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(stateCallback)) })
+	mu.Lock()
+	cacheTotalTokens = 2048
+	mu.Unlock()
+	require.NoError(t, model.DB.Model(&user).Update("quota", 10000).Error)
+	require.NoError(t, model.DB.Model(&token).Update("remain_quota", 10000).Error)
+	// The observer is reused below, so discard setup updates before the next reserve.
+	select {
+	case <-refunded:
+	default:
+	}
+	cleanupObserved.Store(false)
+	failedStateCommit.Store(1)
+	response = doRequest(http.MethodPost, "/v1beta/cachedContents", createBody, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code)
+	require.True(t, cleanupObserved.Load())
+	select {
+	case <-refunded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("activation failure refund did not finish")
+	}
+	require.NoError(t, model.DB.First(&refundedUser, user.Id).Error)
+	require.NoError(t, model.DB.First(&refundedToken, token.Id).Error)
+	assert.Equal(t, 10000, refundedUser.Quota)
+	assert.Equal(t, 10000, refundedToken.RemainQuota)
+	require.NoError(t, model.DB.Model(&model.GeminiCachedContent{}).Where("state = ?", model.GeminiCachedContentActive).Count(&active).Error)
+	assert.Zero(t, active)
+	failedStateCommit.Store(0)
+	cleanupObserved.Store(false)
+	response = doRequest(http.MethodPost, "/v1beta/cachedContents", createBody, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &resource))
+	secondName := resource["name"].(string)
+	var beforeFailedPatch model.User
+	require.NoError(t, model.DB.First(&beforeFailedPatch, user.Id).Error)
+	var secondBinding model.GeminiCachedContent
+	require.NoError(t, model.DB.Where("public_id = ?", strings.TrimPrefix(secondName, "cachedContents/")).First(&secondBinding).Error)
+	priorExpiry, priorPaid := secondBinding.ExpiresAt, secondBinding.PaidUntil
+	failedStateCommit.Store(2)
+	response = doRequest(http.MethodPatch, "/v1beta/"+secondName, `{"ttl":"7200s"}`, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code)
+	select {
+	case <-refunded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mutation failure refund did not finish")
+	}
+	require.NoError(t, model.DB.First(&refundedUser, user.Id).Error)
+	assert.Equal(t, beforeFailedPatch.Quota, refundedUser.Quota)
+	require.NoError(t, model.DB.First(&secondBinding, secondBinding.ID).Error)
+	assert.Equal(t, model.GeminiCachedContentActive, secondBinding.State)
+	assert.Equal(t, priorExpiry, secondBinding.ExpiresAt)
+	assert.Equal(t, priorPaid, secondBinding.PaidUntil)
+	mu.Lock()
+	assert.Equal(t, time.Unix(priorExpiry, 0).UTC().Format(time.RFC3339), upstreamExpiry)
+	mu.Unlock()
+	failedStateCommit.Store(0)
+	// An unconfirmed rollback must keep both the lease and the paid reservation.
+	require.NoError(t, model.DB.First(&beforeFailedPatch, user.Id).Error)
+	failedStateCommit.Store(2)
+	failedRollback.Store(true)
+	response = doRequest(http.MethodPatch, "/v1beta/"+secondName, `{"ttl":"7200s"}`, token.Key)
+	require.NotEqual(t, http.StatusOK, response.Code)
+	require.NoError(t, model.DB.First(&refundedUser, user.Id).Error)
+	assert.Less(t, refundedUser.Quota, beforeFailedPatch.Quota)
+	require.NoError(t, model.DB.First(&secondBinding, secondBinding.ID).Error)
+	assert.Equal(t, model.GeminiCachedContentMutating, secondBinding.State)
+	assert.Equal(t, priorPaid, secondBinding.PaidUntil)
+	failedRollback.Store(false)
+	failedStateCommit.Store(0)
+
+	for _, tc := range []struct {
+		name         string
+		mode         int32
+		tokens       int
+		stateFailure int32
+	}{
+		{"activation cleanup failed", 1, 2048, 1},
+		{"create outcome unknown", 2, 2048, 0},
+		{"invalid response cleanup failed", 3, service.GeminiCacheMaxTokens + 1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uncertainCreate.Store(tc.mode)
+			failedStateCommit.Store(tc.stateFailure)
+			mu.Lock()
+			cacheTotalTokens = tc.tokens
+			mu.Unlock()
+			require.NoError(t, model.DB.Model(&user).Update("quota", 10000).Error)
+			require.NoError(t, model.DB.Model(&token).Update("remain_quota", 10000).Error)
+			response = doRequest(http.MethodPost, "/v1beta/cachedContents", createBody, token.Key)
+			require.NotEqual(t, http.StatusOK, response.Code)
+			require.NoError(t, model.DB.First(&refundedUser, user.Id).Error)
+			require.NoError(t, model.DB.First(&refundedToken, token.Id).Error)
+			assert.Less(t, refundedUser.Quota, 10000)
+			assert.Equal(t, refundedUser.Quota, refundedToken.RemainQuota)
+			var pending model.GeminiCachedContent
+			require.NoError(t, model.DB.Order("id DESC").First(&pending).Error)
+			assert.Equal(t, model.GeminiCachedContentPending, pending.State)
+			if tc.mode != 2 {
+				assert.Equal(t, "cachedContents/private-upstream", pending.UpstreamName)
+			}
+			var audit model.Log
+			require.NoError(t, model.DB.Where("type = ?", model.LogTypeError).Order("id DESC").First(&audit).Error)
+			assert.Contains(t, audit.Other, pending.PublicID)
+			assert.Contains(t, audit.Other, `"cache_reconciliation_required":true`)
+			assert.Contains(t, audit.Other, `"cache_reserved_quota":`)
+		})
+	}
 }

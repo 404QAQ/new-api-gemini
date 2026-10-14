@@ -11,6 +11,8 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
 	dto.FilterResponsesWebSocket,
+	dto.FilterGeminiExplicitCache,
+	dto.FilterGeminiExternalCache,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
@@ -89,6 +91,11 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterGeminiExternalCache:
+		return ch.Type != constant.ChannelTypeGemini
+	case dto.FilterGeminiExplicitCache:
+		_, supported := GeminiCacheChannelBaseURL(ch)
+		return supported
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true

@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -128,6 +130,9 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if _, bound := common.GetContextKeyType[*model.GeminiCachedContent](c, constant.ContextKeyGeminiCachedContent); bound {
+			return types.NewErrorWithStatusCode(errors.New(service.LocalizeGeminiCacheError(c, "Cached content request could not be completed")), types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
 		logger.LogError(c, common.LogText("Do gemini request failed: %s", err.Error()))
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
@@ -139,6 +144,14 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
+			if _, bound := common.GetContextKeyType[*model.GeminiCachedContent](c, constant.ContextKeyGeminiCachedContent); bound {
+				defer httpResp.Body.Close()
+				status := httpResp.StatusCode
+				if status == http.StatusNotFound || status == http.StatusUnauthorized {
+					status = http.StatusForbidden
+				}
+				return types.NewErrorWithStatusCode(errors.New(service.LocalizeGeminiCacheError(c, "Cached content request rejected by upstream")), types.ErrorCodeBadResponseStatusCode, status, types.ErrOptionWithSkipRetry())
+			}
 			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)

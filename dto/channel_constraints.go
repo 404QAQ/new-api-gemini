@@ -3,8 +3,9 @@ package dto
 type ChannelPinSource string
 
 const (
-	PinSourceToken      ChannelPinSource = "token"       // Rank 0, highest
-	PinSourceOriginTask ChannelPinSource = "origin_task" // Rank 10
+	PinSourceToken       ChannelPinSource = "token"       // Rank 0, highest
+	PinSourceOriginTask  ChannelPinSource = "origin_task" // Rank 10
+	PinSourceGeminiCache ChannelPinSource = "gemini_cache"
 )
 
 const (
@@ -36,9 +37,11 @@ type ChannelPin struct {
 type ChannelFilterKind string
 
 const (
-	FilterRequestPath        ChannelFilterKind = "request_path"
-	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
-	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
+	FilterRequestPath         ChannelFilterKind = "request_path"
+	FilterTaskPluginIdentity  ChannelFilterKind = "task_plugin_identity"
+	FilterResponsesWebSocket  ChannelFilterKind = "responses_websocket"
+	FilterGeminiExplicitCache ChannelFilterKind = "gemini_explicit_cache"
+	FilterGeminiExternalCache ChannelFilterKind = "gemini_external_cache"
 )
 
 type ChannelFilter struct {

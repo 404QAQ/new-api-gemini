@@ -61,6 +61,16 @@ func SetRelayRouter(router *gin.Engine) {
 		})
 	}
 
+	cacheRouter := router.Group("/v1beta/cachedContents")
+	cacheRouter.Use(middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), middleware.ModelRequestRateLimit())
+	{
+		cacheRouter.POST("", controller.GeminiCachedContentCreate)
+		cacheRouter.GET("", controller.GeminiCachedContentList)
+		cacheRouter.GET("/:cacheID", controller.GeminiCachedContentGet)
+		cacheRouter.PATCH("/:cacheID", controller.GeminiCachedContentPatch)
+		cacheRouter.DELETE("/:cacheID", controller.GeminiCachedContentDelete)
+	}
+
 	playgroundRouter := router.Group("/pg")
 	playgroundRouter.Use(middleware.RouteTag("relay"))
 	playgroundRouter.Use(middleware.SystemPerformanceCheck())
