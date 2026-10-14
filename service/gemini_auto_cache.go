@@ -15,7 +15,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
-	"gorm.io/gorm"
 )
 
 // GeminiAutoCacheResult contains an attempt-local optimization. The caller must
@@ -187,8 +186,20 @@ func PrepareGeminiAutoCache(c *gin.Context, info *relaycommon.RelayInfo, channel
 		return nil, err
 	}
 	byKey := make(map[string]*model.GeminiAutoCacheSlot, len(slots))
+	publicIDs := make([]string, 0, len(slots))
 	for i := range slots {
 		byKey[slots[i].Key] = &slots[i]
+		if slots[i].PublicID != "" {
+			publicIDs = append(publicIDs, slots[i].PublicID)
+		}
+	}
+	records, err := model.FindGeminiCachedContentsByPublicIDs(binding.UserID, binding.TokenID, publicIDs)
+	if err != nil {
+		return nil, err
+	}
+	byPublicID := make(map[string]*model.GeminiCachedContent, len(records))
+	for i := range records {
+		byPublicID[records[i].PublicID] = &records[i]
 	}
 	now, blocked := time.Now().Unix(), false
 	for i := len(prefixes) - 1; i >= 0; i-- {
@@ -198,11 +209,8 @@ func PrepareGeminiAutoCache(c *gin.Context, info *relaycommon.RelayInfo, channel
 			continue
 		}
 		if slot.PublicID != "" {
-			record, err := model.GetGeminiCachedContent(binding.UserID, binding.TokenID, slot.PublicID)
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, err
-			}
-			if err == nil && record.Group == binding.Group && record.ChannelID == binding.ChannelID && record.KeyFingerprint == binding.KeyFingerprint &&
+			record := byPublicID[slot.PublicID]
+			if record != nil && record.Group == binding.Group && record.ChannelID == binding.ChannelID && record.KeyFingerprint == binding.KeyFingerprint &&
 				record.BaseURL == binding.BaseURL && record.Model == binding.Model && record.UpstreamModel == binding.UpstreamModel && record.ExpiresAt > now+5 {
 				if _, _, err := GeminiCacheBinding(channel, record); err == nil {
 					body, err := geminiAutoCacheReferenceBody(fields, contents, prefix.Length, "cachedContents/"+record.PublicID)
@@ -216,6 +224,13 @@ func PrepareGeminiAutoCache(c *gin.Context, info *relaycommon.RelayInfo, channel
 	}
 	if blocked || c.Request.Context().Err() != nil {
 		return nil, nil
+	}
+	// The relay's local estimate covers the complete generation prompt, so an
+	// estimate below the cache threshold cannot make the reusable prefix reach
+	// that threshold. Treat an under-estimate as a missed optimization rather
+	// than trusting it for billing; unknown estimates still use countTokens.
+	if estimate := info.GetEstimatePromptTokens(); estimate > 0 && estimate < minimum {
+		return nil, ErrGeminiCacheBelowMinimumTokens
 	}
 	// Missing prices are a configuration issue, not a per-prefix failure.
 	// Avoid creating durable cooldown rows for every unpriced conversation.

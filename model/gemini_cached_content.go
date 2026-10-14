@@ -71,6 +71,21 @@ func GetGeminiCachedContent(userID, tokenID int, publicID string) (*GeminiCached
 	return &record, nil
 }
 
+// FindGeminiCachedContentsByPublicIDs loads reusable cache bindings in one
+// query. Prefix matching may check up to 256 candidate IDs for one owner.
+func FindGeminiCachedContentsByPublicIDs(userID, tokenID int, publicIDs []string) ([]GeminiCachedContent, error) {
+	if userID <= 0 || tokenID <= 0 || len(publicIDs) > 256 {
+		return nil, ErrGeminiCachedContentInvalid
+	}
+	if len(publicIDs) == 0 {
+		return []GeminiCachedContent{}, nil
+	}
+	records := make([]GeminiCachedContent, 0, len(publicIDs))
+	err := DB.Where("user_id = ? AND token_id = ? AND public_id IN ? AND state = ? AND expires_at > ?",
+		userID, tokenID, publicIDs, GeminiCachedContentActive, common.GetTimestamp()).Find(&records).Error
+	return records, err
+}
+
 // GetGeminiCachedContentForRecovery includes pending and uncertain mutations so
 // callers can reconcile upstream state without exposing the resource for reuse.
 func GetGeminiCachedContentForRecovery(userID, tokenID int, publicID string) (*GeminiCachedContent, error) {

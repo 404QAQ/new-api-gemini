@@ -220,6 +220,8 @@ func testGeminiAutoCacheLifecycle(t *testing.T, providerType int) {
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousMemory, previousBatch, previousLogs
 	})
+	previousCountToken := constant.CountToken
+	t.Cleanup(func() { constant.CountToken = previousCountToken })
 	previousStreamingTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
 	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
@@ -410,6 +412,7 @@ func testGeminiAutoCacheLifecycle(t *testing.T, providerType int) {
 			delete(settings.BillingExpr, "gemini-2.5-flash-cache-create")
 		case "too-short":
 			countTokens = 12
+			constant.CountToken = true
 		case "rejected":
 			createStatus = 400
 		case "uncertain":
@@ -429,13 +432,14 @@ func testGeminiAutoCacheLifecycle(t *testing.T, providerType int) {
 			assert.Equal(t, beforeCount, counts)
 			assert.Equal(t, beforeCreate, creates)
 		case "too-short":
-			assert.Equal(t, beforeCount+1, counts)
+			assert.Equal(t, beforeCount, counts)
 			assert.Equal(t, beforeCreate, creates)
 		default:
 			assert.Equal(t, beforeCreate+1, creates, "failed or uncertain creation cannot repeat immediately")
 		}
 		settings.BillingExpr["gemini-2.5-flash-cache-create"] = price
 		countTokens, createStatus = 5000, 200
+		constant.CountToken = previousCountToken
 		channel.Setting = common.GetPointer(`{"gemini_explicit_cache_enabled":true,"gemini_auto_cache_enabled":true}`)
 		require.NoError(t, model.DB.Save(&channel).Error)
 	}

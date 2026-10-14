@@ -92,7 +92,9 @@ func (a *geminiCacheAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayIn
 		return nil, errors.New("CachedContent not found (or permission denied)")
 	}
 	// Recheck live configuration after conversion, including affinity overrides
-	// and credentials removed while the request was being prepared.
+	// and credentials removed while the request was being prepared. This is
+	// intentionally a direct read: a stale in-memory snapshot must not authorize
+	// a cached-content request after an administrator disables the channel.
 	channelConfig, err := model.GetChannelById(record.ChannelID, true)
 	if err != nil {
 		return nil, errors.New("Cached content channel is unavailable")

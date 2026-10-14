@@ -440,3 +440,44 @@ func TestGeminiAutoCacheSlotValidation(t *testing.T) {
 	_, err = FinishGeminiAutoCacheSlot(&GeminiAutoCacheSlot{Key: key, ClaimToken: key}, "", 0)
 	assert.ErrorIs(t, err, ErrGeminiAutoCacheSlotInvalid)
 }
+
+func TestFindGeminiCachedContentsByPublicIDs(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db := openGeminiCacheTestDatabase(t, dialect)
+			require.NoError(t, db.AutoMigrate(&GeminiCachedContent{}))
+			now := common.GetTimestamp()
+			base := GeminiCachedContent{
+				UserID: 11, TokenID: 22, ChannelID: 33, Group: "default", KeyFingerprint: strings.Repeat("a", 64),
+				BaseURL: "https://generativelanguage.googleapis.com", Model: "gemini-2.5-flash", UpstreamModel: "gemini-2.5-flash",
+				UpstreamName: "cachedContents/upstream", DisplayName: "test", TotalTokens: 4096, State: GeminiCachedContentActive,
+			}
+			fixtures := make([]GeminiCachedContent, 5)
+			for i, publicID := range []string{"a", "b", "c", "d", "e"} {
+				fixtures[i] = base
+				fixtures[i].PublicID = strings.Repeat(publicID, 32)
+				fixtures[i].ExpiresAt = now + 3600
+			}
+			fixtures[1].ExpiresAt = now - 1
+			fixtures[2].State = GeminiCachedContentPending
+			fixtures[3].UserID = 12
+			fixtures[4].TokenID = 23
+			for i := range fixtures {
+				require.NoError(t, db.Create(&fixtures[i]).Error)
+			}
+
+			records, err := FindGeminiCachedContentsByPublicIDs(11, 22, []string{
+				fixtures[0].PublicID, fixtures[1].PublicID, fixtures[2].PublicID, fixtures[3].PublicID, fixtures[4].PublicID,
+			})
+			require.NoError(t, err)
+			require.Len(t, records, 1)
+			assert.Equal(t, fixtures[0].PublicID, records[0].PublicID)
+
+			empty, err := FindGeminiCachedContentsByPublicIDs(11, 22, nil)
+			require.NoError(t, err)
+			assert.Empty(t, empty)
+			_, err = FindGeminiCachedContentsByPublicIDs(11, 22, make([]string, 257))
+			assert.ErrorIs(t, err, ErrGeminiCachedContentInvalid)
+		})
+	}
+}

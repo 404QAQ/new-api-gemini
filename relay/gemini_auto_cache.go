@@ -40,7 +40,7 @@ func doRequestWithGeminiAutoCache(c *gin.Context, info *relaycommon.RelayInfo, o
 		response, err := original.DoRequest(c, info, body)
 		return response, original, err
 	}
-	channelConfig, err := model.GetChannelById(info.ChannelId, true)
+	channelConfig, err := model.CacheGetChannel(info.ChannelId)
 	if err != nil || channelConfig == nil || !channelConfig.GetSetting().GeminiAutoCacheEnabled {
 		response, requestErr := original.DoRequest(c, info, body)
 		return response, original, requestErr
