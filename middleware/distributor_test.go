@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	hostdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -389,50 +390,61 @@ func (s *geminiCacheDiskStorageProbe) NewReader() (io.ReadCloser, error) {
 }
 
 func TestGeminiCachePreparationStreamsOrdinaryDiskBody(t *testing.T) {
-	body := `{"contents":[{"parts":[{"text":"cachedContent is ordinary text"}]}]}`
-	file, err := os.Create(filepath.Join(t.TempDir(), "request.json"))
-	require.NoError(t, err)
-	_, err = file.WriteString(body)
-	require.NoError(t, err)
-	storage := &geminiCacheDiskStorageProbe{File: file, size: int64(len(body))}
-	t.Cleanup(func() { require.NoError(t, file.Close()) })
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", nil)
-	ctx.Set(common.KeyBodyStorage, storage)
-	require.True(t, prepareGeminiCacheReference(ctx))
-	assert.Zero(t, storage.wholeReads)
-	replayed, err := io.ReadAll(storage)
-	require.NoError(t, err)
-	assert.Equal(t, body, string(replayed), "independent scanner must leave the relay reader at the start")
+	for _, tc := range []struct{ path, body string }{
+		{"/v1beta/models/gemini-2.5-flash:generateContent", `{"contents":[{"parts":[{"text":"cachedContent is ordinary text"}]}]}`},
+		{"/v1/chat/completions", `{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"cached_content is ordinary text"}]}`},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			file, err := os.Create(filepath.Join(t.TempDir(), "request.json"))
+			require.NoError(t, err)
+			_, err = file.WriteString(tc.body)
+			require.NoError(t, err)
+			storage := &geminiCacheDiskStorageProbe{File: file, size: int64(len(tc.body))}
+			t.Cleanup(func() { require.NoError(t, file.Close()) })
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, tc.path, nil)
+			ctx.Set(common.KeyBodyStorage, storage)
+			require.True(t, prepareGeminiCacheReference(ctx))
+			assert.Zero(t, storage.wholeReads)
+			replayed, err := io.ReadAll(storage)
+			require.NoError(t, err)
+			assert.Equal(t, tc.body, string(replayed), "independent scanner must leave the relay reader at the start")
+		})
+	}
+}
+
+func setupGeminiCacheRoutingDB(t *testing.T) {
+	t.Helper()
+	previousDB, previousLogDB := model.DB, model.LOG_DB
+	previousMaster, previousPath := common.IsMasterNode, common.SQLitePath
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousMemory, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+	var database *gorm.DB
+	t.Cleanup(func() {
+		if database != nil {
+			sqlDB, err := database.DB()
+			require.NoError(t, err)
+			require.NoError(t, sqlDB.Close())
+		}
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.IsMasterNode, common.SQLitePath = previousMaster, previousPath
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		common.MemoryCacheEnabled, common.RedisEnabled = previousMemory, previousRedis
+	})
+	t.Setenv("SQL_DSN", "local")
+	common.IsMasterNode = false
+	common.SQLitePath = filepath.Join(t.TempDir(), "cache-routing.db")
+	common.MemoryCacheEnabled, common.RedisEnabled = false, false
+	require.NoError(t, model.InitDB())
+	database = model.DB
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.GeminiCachedContent{}, &model.Ability{}))
 }
 
 func TestGeminiCacheExternalReferencesRetainNonGeminiRouting(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	for _, provider := range []int{constant.ChannelTypeNewAPI, constant.ChannelTypeAdvancedCustom, constant.ChannelTypeVertexAi} {
 		t.Run(fmt.Sprint(provider), func(t *testing.T) {
-			previousDB, previousLogDB := model.DB, model.LOG_DB
-			previousMaster, previousPath := common.IsMasterNode, common.SQLitePath
-			previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
-			previousMemory, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
-			var database *gorm.DB
-			t.Cleanup(func() {
-				if database != nil {
-					sqlDB, err := database.DB()
-					require.NoError(t, err)
-					require.NoError(t, sqlDB.Close())
-				}
-				model.DB, model.LOG_DB = previousDB, previousLogDB
-				common.IsMasterNode, common.SQLitePath = previousMaster, previousPath
-				common.SetDatabaseTypes(previousMainType, previousLogType)
-				common.MemoryCacheEnabled, common.RedisEnabled = previousMemory, previousRedis
-			})
-			t.Setenv("SQL_DSN", "local")
-			common.IsMasterNode = false
-			common.SQLitePath = filepath.Join(t.TempDir(), "cache-routing.db")
-			common.MemoryCacheEnabled, common.RedisEnabled = false, false
-			require.NoError(t, model.InitDB())
-			database = model.DB
-			require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.GeminiCachedContent{}, &model.Ability{}))
+			setupGeminiCacheRoutingDB(t)
 			gemini := model.Channel{Type: constant.ChannelTypeGemini, Name: "shared Gemini key", Status: common.ChannelStatusEnabled, Key: "shared-key", Models: "gemini-2.5-flash", Group: "default", Priority: common.GetPointer(int64(100))}
 			require.NoError(t, gemini.Insert())
 			external := model.Channel{Type: provider, Name: "external cache provider", Status: common.ChannelStatusEnabled, Key: "external-key", Models: "gemini-2.5-flash", Group: "default"}
@@ -450,14 +462,17 @@ func TestGeminiCacheExternalReferencesRetainNonGeminiRouting(t *testing.T) {
 				assert.Equal(t, external.Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
 				c.Status(http.StatusNoContent)
 			})
-			dispatch := func(name string) *httptest.ResponseRecorder {
+			dispatchBody := func(body string) *httptest.ResponseRecorder {
 				t.Helper()
-				body := `{"cachedContent":"` + name + `","contents":[{"role":"user","parts":[{"text":"continue"}]}]}`
 				request := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", strings.NewReader(body))
 				request.Header.Set("Content-Type", "application/json")
 				response := httptest.NewRecorder()
 				engine.ServeHTTP(response, request)
 				return response
+			}
+			dispatch := func(name string) *httptest.ResponseRecorder {
+				t.Helper()
+				return dispatchBody(`{"cachedContent":"` + name + `","contents":[{"role":"user","parts":[{"text":"continue"}]}]}`)
 			}
 			const publicID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 			for _, name := range []string{"cachedContents/foo", "cachedContents/" + publicID, "projects/project-id/locations/us-central1/cachedContents/cache-id"} {
@@ -466,6 +481,16 @@ func TestGeminiCacheExternalReferencesRetainNonGeminiRouting(t *testing.T) {
 			}
 			record := model.GeminiCachedContent{PublicID: publicID, UserID: 99, TokenID: 99, ChannelID: gemini.Id, Group: "default", Model: "gemini-2.5-flash", State: model.GeminiCachedContentActive, ExpiresAt: time.Now().Add(time.Hour).Unix()}
 			require.NoError(t, model.DB.Create(&record).Error)
+			for _, body := range []string{
+				`{"CachedContent":"cachedContents/` + publicID + `"}`,
+				`{"cachedContent":"cachedContents/external","CachedContent":"cachedContents/` + publicID + `"}`,
+				`{"cachedContent":"cachedContents/` + publicID + `","CachedContent":"cachedContents/` + publicID + `"}`,
+				`{"GenerateContentRequest":{"CachedContent":"cachedContents/` + publicID + `"}}`,
+				`{"cachedContent":"cachedContents/external","generateContentRequeſt":{"cachedContent":"cachedContents/` + publicID + `"}}`,
+			} {
+				response := dispatchBody(body)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			}
 			for _, state := range []string{model.GeminiCachedContentActive, model.GeminiCachedContentPending, model.GeminiCachedContentMutating, model.GeminiCachedContentDeleted} {
 				require.NoError(t, model.DB.Model(&record).Update("state", state).Error)
 				response := dispatch("cachedContents/" + publicID)
@@ -485,4 +510,97 @@ func TestGeminiCacheExternalReferencesRetainNonGeminiRouting(t *testing.T) {
 			require.NoError(t, model.DB.Callback().Query().Remove(callback))
 		})
 	}
+}
+
+func TestGeminiCacheOpenAIReferencesBindOwnerAndCredential(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	setupGeminiCacheRoutingDB(t)
+	channel := model.Channel{Type: constant.ChannelTypeGemini, Name: "managed Gemini", Status: common.ChannelStatusEnabled, Key: "other-key\noriginal-key", Models: "gemini-alias", Group: "default"}
+	channel.ModelMapping = common.GetPointer(`{"gemini-alias":"gemini-2.5-flash"}`)
+	channel.ChannelInfo.IsMultiKey = true
+	require.NoError(t, channel.Insert())
+	record := model.GeminiCachedContent{
+		PublicID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", UserID: 1, TokenID: 2,
+		ChannelID: channel.Id, Group: "default", Model: "gemini-alias", UpstreamModel: "gemini-2.5-flash",
+		KeyFingerprint: service.GeminiCacheKeyFingerprint("original-key"), BaseURL: "https://generativelanguage.googleapis.com",
+		State: model.GeminiCachedContentActive, ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&record).Error)
+	const body = `{"model":"gemini-alias","messages":[{"role":"user","content":"continue"}],"extra_body":{"google":{"cached_content":"cachedContents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}`
+	for _, tc := range []struct {
+		name   string
+		body   string
+		change func(*gin.Context, *model.GeminiCachedContent)
+		status int
+	}{
+		{name: "owner gets the original credential", status: http.StatusNoContent},
+		{name: "other user", change: func(c *gin.Context, _ *model.GeminiCachedContent) { c.Set("id", 99) }, status: http.StatusForbidden},
+		{name: "other token", change: func(c *gin.Context, _ *model.GeminiCachedContent) { c.Set("token_id", 99) }, status: http.StatusForbidden},
+		{name: "different model", body: strings.Replace(body, "gemini-alias", "other-model", 1), status: http.StatusForbidden},
+		{name: "different group", change: func(c *gin.Context, _ *model.GeminiCachedContent) {
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "other-group")
+		}, status: http.StatusForbidden},
+		{name: "token model restriction", change: func(c *gin.Context, _ *model.GeminiCachedContent) {
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+			common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"other-model": true})
+		}, status: http.StatusForbidden},
+		{name: "conflicting pin", change: func(c *gin.Context, _ *model.GeminiCachedContent) {
+			service.GetChannelConstraints(c).AddPin(hostdto.ChannelPin{ChannelId: channel.Id + 1})
+		}, status: http.StatusForbidden},
+		{name: "pending", change: func(_ *gin.Context, r *model.GeminiCachedContent) { r.State = model.GeminiCachedContentPending }, status: http.StatusForbidden},
+		{name: "mutating", change: func(_ *gin.Context, r *model.GeminiCachedContent) { r.State = model.GeminiCachedContentMutating }, status: http.StatusForbidden},
+		{name: "deleted", change: func(_ *gin.Context, r *model.GeminiCachedContent) { r.State = model.GeminiCachedContentDeleted }, status: http.StatusForbidden},
+		{name: "expired", change: func(_ *gin.Context, r *model.GeminiCachedContent) { r.ExpiresAt = time.Now().Add(-time.Hour).Unix() }, status: http.StatusForbidden},
+		{name: "unknown public ID", body: strings.Replace(body, record.PublicID, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1), status: http.StatusForbidden},
+		{name: "external Vertex name", body: strings.Replace(body, "cachedContents/"+record.PublicID, "projects/p/locations/us-central1/cachedContents/external", 1), status: http.StatusForbidden},
+		{name: "duplicate container cannot hide local ID", body: strings.TrimSuffix(body, "}") + `,"extra_body":{}}`, status: http.StatusBadRequest},
+		{name: "system message", body: strings.Replace(body, `"role":"user"`, `"role":"system"`, 1), status: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			requestBody := tc.body
+			if requestBody == "" {
+				requestBody = body
+			}
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+			ctx.Set("id", 1)
+			ctx.Set("token_id", 2)
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+			candidate := record
+			if tc.change != nil {
+				tc.change(ctx, &candidate)
+			}
+			require.NoError(t, model.DB.Save(&candidate).Error)
+			t.Cleanup(func() { common.CleanupBodyStorage(ctx) })
+			if prepareGeminiCacheReference(ctx) {
+				require.Nil(t, SetupContextForSelectedChannel(ctx, &channel, "gemini-alias"))
+				assert.Equal(t, channel.Id, common.GetContextKeyInt(ctx, constant.ContextKeyChannelId))
+				assert.Equal(t, "original-key", common.GetContextKeyString(ctx, constant.ContextKeyChannelKey))
+				assert.Equal(t, 1, common.GetContextKeyInt(ctx, constant.ContextKeyChannelMultiKeyIndex))
+				pins := service.GetChannelConstraints(ctx).Pins
+				require.Len(t, pins, 1)
+				assert.Equal(t, hostdto.PinRetrySingleAttempt, pins[0].RetryMode)
+				assert.Equal(t, channel.Id, pins[0].ChannelId)
+				ctx.Status(http.StatusNoContent)
+				ctx.Writer.WriteHeaderNow()
+			}
+			assert.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+		})
+	}
+	// Enforce the managed-cache limit before materializing any disk body.
+	file, err := os.Create(filepath.Join(t.TempDir(), "oversized-cache-request.json"))
+	require.NoError(t, err)
+	_, err = file.WriteString(body)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+	storage := &geminiCacheDiskStorageProbe{File: file, size: service.GeminiCacheMaxRequestBytes + 1}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Set(common.KeyBodyStorage, storage)
+	require.False(t, prepareGeminiCacheReference(ctx))
+	assert.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
+	assert.Zero(t, storage.wholeReads)
 }

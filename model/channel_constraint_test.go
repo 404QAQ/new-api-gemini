@@ -216,3 +216,35 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
 }
+
+func TestGeminiCacheCandidateFilterUsesModelScope(t *testing.T) {
+	vertex := &Channel{Id: 910001, Type: constant.ChannelTypeVertexAi, Status: common.ChannelStatusEnabled, Other: `{"alias":"us-central1","other":"global"}`}
+	global := &Channel{Id: 910002, Type: constant.ChannelTypeVertexAi, Status: common.ChannelStatusEnabled, Other: "global"}
+	malformed := &Channel{Id: 910003, Type: constant.ChannelTypeVertexAi, Status: common.ChannelStatusEnabled, Other: `{"alias":42}`}
+	advanced := &Channel{Id: 910004, Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled, BaseURL: common.GetPointer("https://gateway.example"), Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)}
+	advanced.SetOtherSettings(kitdto.ChannelOtherSettings{AdvancedCustom: &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{{
+		IncomingPath: "/v1beta/models/{model}:generateContent", UpstreamPath: "/v1beta/models/{model}:generateContent", Models: []string{"alias"},
+	}}}})
+	unsafe := *advanced
+	unsafe.Id = 910005
+	unsafe.SetOtherSettings(kitdto.ChannelOtherSettings{AdvancedCustom: &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{{
+		IncomingPath: "/v1beta/models/{model}:generateContent", UpstreamPath: "https://other.example/v1beta/models/{model}:generateContent",
+	}}}})
+	channelSyncLock.Lock()
+	previous := channelsIDM
+	channelsIDM = map[int]*Channel{vertex.Id: vertex, global.Id: global, malformed.Id: malformed, advanced.Id: advanced, unsafe.Id: &unsafe}
+	t.Cleanup(func() {
+		channelsIDM = previous
+		channelSyncLock.Unlock()
+	})
+	filters := []dto.ChannelFilter{{Kind: dto.FilterGeminiExplicitCache}}
+	// The invalid candidates come first, just as high-priority channels would
+	// before selection. Only channels with a usable contract remain eligible.
+	ids := []int{global.Id, malformed.Id, unsafe.Id, vertex.Id, advanced.Id}
+	kept, emptiedBy := filterCandidateIDs(ids, "alias", filters)
+	assert.Equal(t, []int{vertex.Id, advanced.Id}, kept)
+	assert.Empty(t, emptiedBy)
+	kept, emptiedBy = filterCandidateIDs(ids, "other", filters)
+	assert.Empty(t, kept)
+	assert.Equal(t, dto.FilterGeminiExplicitCache, emptiedBy)
+}

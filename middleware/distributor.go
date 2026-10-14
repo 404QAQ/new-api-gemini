@@ -43,9 +43,15 @@ func Distribute() func(c *gin.Context) {
 			}
 		}()
 		constraints := service.GetChannelConstraints(c)
+		requestPath := c.Request.URL.Path
+		if record, bound := common.GetContextKeyType[*model.GeminiCachedContent](c, constant.ContextKeyGeminiCachedContent); bound && record != nil {
+			// Managed cache reuse uses the native Gemini provider even when the
+			// client entered through OpenAI Chat. Check the transport's route.
+			requestPath = "/v1beta/models/" + record.Model + ":generateContent"
+		}
 		constraints.AddFilter(taskdto.ChannelFilter{
 			Kind:        taskdto.FilterRequestPath,
-			RequestPath: c.Request.URL.Path,
+			RequestPath: requestPath,
 		})
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)

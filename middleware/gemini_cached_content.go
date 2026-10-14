@@ -45,33 +45,42 @@ func AuthorizeGeminiCache(c *gin.Context, modelName, group string, channelID int
 
 func prepareGeminiCacheReference(c *gin.Context) bool {
 	path := c.Request.URL.Path
-	if c.Request.Method != http.MethodPost || (!strings.HasPrefix(path, "/v1beta/models/") && !strings.HasPrefix(path, "/v1/models/")) {
+	openAIChat := path == "/v1/chat/completions"
+	if c.Request.Method != http.MethodPost || (!openAIChat && !strings.HasPrefix(path, "/v1beta/models/") && !strings.HasPrefix(path, "/v1/models/")) {
 		return true
+	}
+	hasReference := service.HasGeminiCacheReference
+	readReference := service.GeminiCacheReferenceNameInReader
+	readFailure := "Unable to read Gemini request"
+	if openAIChat {
+		hasReference = service.HasOpenAIGeminiCacheReference
+		readReference = service.OpenAIGeminiCacheReferenceNameInReader
+		readFailure = "Unable to read cached content request"
 	}
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
-		abortGeminiCacheReference(c, invalidRequestStatus(err), "Unable to read Gemini request")
+		abortGeminiCacheReference(c, invalidRequestStatus(err), readFailure)
 		return false
 	}
 	if !storage.IsDisk() {
 		body, readErr := storage.Bytes()
 		if readErr != nil {
-			abortGeminiCacheReference(c, 400, "Unable to read Gemini request")
+			abortGeminiCacheReference(c, 400, readFailure)
 			return false
 		}
-		if !service.HasGeminiCacheReference(body) {
+		if !hasReference(body) {
 			return true
 		}
 	}
 	reader, readErr := storage.NewReader()
 	if readErr != nil {
-		abortGeminiCacheReference(c, 400, "Unable to read Gemini request")
+		abortGeminiCacheReference(c, 400, readFailure)
 		return false
 	}
-	name, scanErr := service.GeminiCacheReferenceNameInReader(reader)
+	name, scanErr := readReference(reader)
 	closeErr := reader.Close()
 	if scanErr != nil {
-		message := "Unable to read Gemini request"
+		message := readFailure
 		var cacheErr *service.GeminiCacheError
 		if errors.As(scanErr, &cacheErr) {
 			message = cacheErr.Message
@@ -80,7 +89,7 @@ func prepareGeminiCacheReference(c *gin.Context) bool {
 		return false
 	}
 	if closeErr != nil {
-		abortGeminiCacheReference(c, 400, "Unable to read Gemini request")
+		abortGeminiCacheReference(c, 400, readFailure)
 		return false
 	}
 	if name == "" {
@@ -97,6 +106,12 @@ func prepareGeminiCacheReference(c *gin.Context) bool {
 		}
 	}
 	if !local {
+		if openAIChat {
+			// The OpenAI conversion cannot safely infer the owner and provider of
+			// an external resource. Never silently discard or route this name.
+			abortGeminiCacheReference(c, http.StatusForbidden, "CachedContent not found (or permission denied)")
+			return false
+		}
 		// External resources retain the provider's existing validation and size
 		// semantics. They can never fall through to shared Gemini API keys.
 		service.GetChannelConstraints(c).AddFilter(dto.ChannelFilter{Kind: dto.FilterGeminiExternalCache})
@@ -108,19 +123,26 @@ func prepareGeminiCacheReference(c *gin.Context) bool {
 	}
 	body, readErr := storage.Bytes()
 	if readErr != nil {
-		abortGeminiCacheReference(c, 400, "Unable to read Gemini request")
+		abortGeminiCacheReference(c, 400, readFailure)
 		return false
 	}
-	if _, validationErr := service.ValidateGeminiCacheReference(body); validationErr != nil {
+	modelName := extractModelNameFromGeminiPath(path)
+	var validationErr error
+	if openAIChat {
+		_, modelName, validationErr = service.ValidateOpenAIGeminiCacheReference(body)
+	} else {
+		_, validationErr = service.ValidateGeminiCacheReference(body)
+	}
+	if validationErr != nil {
 		abortGeminiCacheReference(c, 400, validationErr.Error())
 		return false
 	}
-	if !strings.HasSuffix(path, ":generateContent") && !strings.HasSuffix(path, ":streamGenerateContent") {
+	if !openAIChat && !strings.HasSuffix(path, ":generateContent") && !strings.HasSuffix(path, ":streamGenerateContent") {
 		abortGeminiCacheReference(c, 400, "Cached content requires generateContent or streamGenerateContent")
 		return false
 	}
 	record, err := model.GetGeminiCachedContent(c.GetInt("id"), c.GetInt("token_id"), id)
-	if err != nil || record.Model != extractModelNameFromGeminiPath(path) {
+	if err != nil || record.Model != modelName {
 		abortGeminiCacheReference(c, http.StatusForbidden, "CachedContent not found (or permission denied)")
 		return false
 	}

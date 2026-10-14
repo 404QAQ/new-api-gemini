@@ -94,10 +94,19 @@ func TestGeminiCacheReferenceValidation(t *testing.T) {
 		{"incremental content", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","contents":[{"parts":[{"text":"next"}]}]}`, "cachedContents/aaaaaaaaaaaaaaaa", false},
 		{"count tokens", `{"generateContentRequest":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","contents":[{"parts":[{"text":"next"}]}]}}`, "cachedContents/aaaaaaaaaaaaaaaa", false},
 		{"alias", `{"cached_content":"cachedContents/aaaaaaaaaaaaaaaa"}`, "", true},
+		{"case alias", `{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`, "", true},
+		{"same reference with case alias", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`, "", true},
 		{"nested alias", `{"generate_content_request":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`, "", true},
+		{"case alias in wrapper", `{"GenerateContentRequest":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`, "", true},
+		{"Unicode case alias in wrapper", `{"generateContentRequeſt":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`, "", true},
+		{"nested case alias", `{"generateContentRequest":{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`, "", true},
 		{"duplicate reference", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","cachedContent":"cachedContents/bbbbbbbbbbbbbbbb"}`, "", true},
 		{"conflicting references", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","generateContentRequest":{"cachedContent":"cachedContents/bbbbbbbbbbbbbbbb"}}`, "", true},
 		{"duplicate immutable system", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","systemInstruction":{"parts":[{"text":"override"}]}}`, "", true},
+		{"case alias immutable system", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","SystemInstruction":{"parts":[{"text":"override"}]}}`, "", true},
+		{"Unicode case alias immutable system", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","ſystemInstruction":{"parts":[{"text":"override"}]}}`, "", true},
+		{"case alias immutable tool config", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","ToolConfig":{}}`, "", true},
+		{"nested case alias immutable config", `{"generateContentRequest":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","ToolConfig":{}}}`, "", true},
 		{"duplicate immutable tools", `{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","tools":[]}`, "", true},
 		{"ordinary request", `{"contents":[{"parts":[{"text":"hello"}]}]}`, "", false},
 	} {
@@ -265,6 +274,9 @@ func TestGeminiCacheReferenceDetectionDoesNotMissDuplicateOrEscapedKeys(t *testi
 	for _, body := range []string{
 		`{"cachedContent":"","cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
 		`{"cached\u0043ontent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
+		`{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
+		`{"GenerateContentRequest":{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
+		`{"generateContentRequeſt":{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
 		`{"generate_content_request":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
 		`{"generateContentRequest":{"cached_content":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
 		`{"generateContentRequest":{},"generateContentRequest":{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
@@ -323,6 +335,9 @@ func TestGeminiCacheReferenceReader(t *testing.T) {
 	}{
 		{`{"cachedContent":"cachedContents/a"}`, true},
 		{`{"cached\u0043ontent":"cachedContents/a"}`, true},
+		{`{"CachedContent":"cachedContents/a"}`, true},
+		{`{"GenerateContentRequest":{"CachedContent":"cachedContents/a"}}`, true},
+		{`{"generateContentRequeſt":{"CachedContent":"cachedContents/a"}}`, true},
 		{`{"cachedContent":"","cachedContent":"cachedContents/a"}`, true},
 		{`{"generateContentRequest":{},"generateContentRequest":{"cachedContent":"cachedContents/a"}}`, true},
 		{`{"generate_content_request":{"cached_content":"cachedContents/a"}}`, true},
@@ -370,6 +385,10 @@ func TestGeminiCacheReferenceReader(t *testing.T) {
 func TestGeminiCacheReferenceReaderRejectsAmbiguousAccountRouting(t *testing.T) {
 	for _, body := range []string{
 		`{"cachedContent":"cachedContents/external","cachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
+		`{"cachedContent":"cachedContents/external","CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
+		`{"cachedContent":"cachedContents/aaaaaaaaaaaaaaaa","CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}`,
+		`{"cachedContent":"cachedContents/external","GenerateContentRequest":{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
+		`{"cachedContent":"cachedContents/external","generateContentRequeſt":{"CachedContent":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
 		`{"cachedContent":"cachedContents/external","generate_content_request":{"cached_content":"cachedContents/aaaaaaaaaaaaaaaa"}}`,
 		`{"cachedContent":null}`,
 	} {
@@ -379,4 +398,281 @@ func TestGeminiCacheReferenceReaderRejectsAmbiguousAccountRouting(t *testing.T) 
 	name, err := GeminiCacheReferenceNameInReader(strings.NewReader(`{"generateContentRequest":{},"generateContentRequest":{"cached\u0043ontent":"projects/p/locations/l/cachedContents/id"}}`))
 	require.NoError(t, err)
 	assert.Equal(t, "projects/p/locations/l/cachedContents/id", name)
+}
+
+func TestGeminiCacheOpenAIReferenceValidation(t *testing.T) {
+	const reference = `"extra_body":{"google":{"cached_content":"cachedContents/aaaaaaaaaaaaaaaa"}}`
+	for _, tc := range []struct {
+		name, body string
+		valid      bool
+	}{
+		{"official field", `{"model":"gemini-alias","messages":[{"role":"user","content":"continue"}],` + reference + `}`, true},
+		{"tool result continues cached tools", `{"model":"gemini-alias","messages":[{"role":"tool","tool_call_id":"call_1","content":"done"}],` + reference + `}`, true},
+		{"system message", `{"model":"gemini-alias","messages":[{"role":"system","content":"change instructions"}],` + reference + `}`, false},
+		{"developer message", `{"model":"gemini-alias","messages":[{"role":"developer","content":"change instructions"}],` + reference + `}`, false},
+		{"tools even null", `{"model":"gemini-alias","messages":[{"role":"user"}],"tools":null,` + reference + `}`, false},
+		{"legacy functions", `{"model":"gemini-alias","messages":[{"role":"user"}],"functions":[],` + reference + `}`, false},
+		{"tool choice", `{"model":"gemini-alias","messages":[{"role":"user"}],"tool_choice":"none",` + reference + `}`, false},
+		{"legacy function choice", `{"model":"gemini-alias","messages":[{"role":"user"}],"function_call":"auto",` + reference + `}`, false},
+		{"duplicate model", `{"model":"gemini-alias","model":"different","messages":[{"role":"user"}],` + reference + `}`, false},
+		{"case variant model override", `{"model":"gemini-alias","MODEL":"different","messages":[{"role":"user"}],` + reference + `}`, false},
+		{"case variant message override", `{"model":"gemini-alias","messages":[{"role":"user"}],"Messages":[{"role":"system"}],` + reference + `}`, false},
+		{"Unicode case fold message override", `{"model":"gemini-alias","messages":[{"role":"user"}],"meſſages":[{"role":"system"}],` + reference + `}`, false},
+		{"case variant tools", `{"model":"gemini-alias","messages":[{"role":"user"}],"TOOLS":[],` + reference + `}`, false},
+		{"case variant container override", `{"model":"gemini-alias","messages":[{"role":"user"}],` + reference + `,"EXTRA_BODY":{}}`, false},
+		{"duplicate container", `{"model":"gemini-alias","messages":[{"role":"user"}],` + reference + `,"extra_body":{}}`, false},
+		{"top-level alias", `{"model":"gemini-alias","messages":[{"role":"user"}],"cached_content":"cachedContents/aaaaaaaaaaaaaaaa"}`, false},
+		{"missing model", `{"messages":[{"role":"user"}],` + reference + `}`, false},
+		{"missing messages", `{"model":"gemini-alias",` + reference + `}`, false},
+		{"nested immutable configuration", `{"model":"gemini-alias","messages":[{"role":"user"}],"extra_body":{"google":{"cached_content":"cachedContents/aaaaaaaaaaaaaaaa","tool_config":{}}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name, modelName, err := ValidateOpenAIGeminiCacheReference([]byte(tc.body))
+			if !tc.valid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "cachedContents/aaaaaaaaaaaaaaaa", name)
+			assert.Equal(t, "gemini-alias", modelName)
+		})
+	}
+}
+
+func TestGeminiCacheOpenAIReferenceReader(t *testing.T) {
+	for _, tc := range []struct {
+		body, want string
+		invalid    bool
+	}{
+		{body: `{"extra_body":{"google":{"cached_content":"cachedContents/a"}}}`, want: "cachedContents/a"},
+		{body: `{"extra_\u0062ody":{"\u0067oogle":{"cached_\u0063ontent":"cachedContents/a"}}}`, want: "cachedContents/a"},
+		{body: `{"extra_body":{},"extra_body":{"google":{"cached_content":"cachedContents/a"}}}`, want: "cachedContents/a"},
+		{body: `{"extra_body":{"google":{"cached_content":"cachedContents/a"},"google":{}}}`, want: "cachedContents/a"},
+		{body: `{"extra_body":{"google":{"cached_content":"cachedContents/a","cached_content":"cachedContents/b"}}}`, invalid: true},
+		{body: `{"extra_body":{"google":{"cached_content":"cachedContents/a","cached_content":"cachedContents/a"}}}`, invalid: true},
+		{body: `{"extra_body":{"google":{"cached_content":null}}}`, invalid: true},
+		{body: `{"cached_content":"cachedContents/a"}`, invalid: true},
+		{body: `{"extra_body":{"google":{"cachedContent":"cachedContents/a"}}}`, invalid: true},
+		{body: `{"extra_body":{"google":{"Cached_Content":"cachedContents/a"}}}`, invalid: true},
+		{body: `{"EXTRA_BODY":{"google":{"cached_content":"cachedContents/a"}}}`, want: "cachedContents/a"},
+		{body: `{"messages":[{"role":"user","content":"extra_body.google.cached_content"}]}`},
+		{body: `{"tools":[{"function":{"parameters":{"properties":{"extra_body":{"google":{"cached_content":{"type":"string"}}}}}}}]}`},
+		{body: `{"extra_body":{"other":{"google":{"cached_content":"ordinary data"}}}}`},
+	} {
+		name, err := OpenAIGeminiCacheReferenceNameInReader(strings.NewReader(tc.body))
+		if tc.invalid {
+			require.Error(t, err, tc.body)
+			assert.True(t, HasOpenAIGeminiCacheReference([]byte(tc.body)), tc.body)
+			continue
+		}
+		require.NoError(t, err, tc.body)
+		assert.Equal(t, tc.want, name, tc.body)
+		assert.Equal(t, tc.want != "", HasOpenAIGeminiCacheReference([]byte(tc.body)), tc.body)
+	}
+	probe := &geminiCacheBoundedReadProbe{Reader: io.MultiReader(
+		strings.NewReader(`{"messages":[{"role":"user","content":"`),
+		strings.NewReader(strings.Repeat("x", 1<<20)),
+		strings.NewReader(`"}],"extra_body":{"google":{"cached_content":"cachedContents/a"}}}`),
+	)}
+	name, err := OpenAIGeminiCacheReferenceNameInReader(probe)
+	require.NoError(t, err)
+	assert.Equal(t, "cachedContents/a", name)
+	assert.LessOrEqual(t, probe.largestRead, 32<<10)
+}
+
+func TestGeminiCacheGatewayProvidersAndBinding(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeNewAPI, constant.ChannelTypeAdvancedCustom} {
+		for _, auth := range []string{"bearer", "google-key"} {
+			if auth == "google-key" && channelType != constant.ChannelTypeAdvancedCustom {
+				continue
+			}
+			t.Run(constant.ChannelTypeNames[channelType]+"/"+auth, func(t *testing.T) {
+				expiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+				calls := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					if auth == "google-key" {
+						assert.Equal(t, "gateway-key", r.Header.Get("x-goog-api-key"))
+						assert.Empty(t, r.Header.Get("Authorization"))
+					} else {
+						assert.Equal(t, "Bearer gateway-key", r.Header.Get("Authorization"))
+						assert.Empty(t, r.Header.Get("x-goog-api-key"))
+					}
+					assert.Empty(t, r.URL.Fragment)
+					if strings.HasSuffix(r.URL.Path, ":countTokens") {
+						assert.Equal(t, "/v1beta/models/gemini-2.5-flash:countTokens", r.URL.Path)
+						_, _ = w.Write([]byte(`{"totalTokens":2048}`))
+						return
+					}
+					assert.Equal(t, "/v1beta/cachedContents", r.URL.Path)
+					response, err := common.Marshal(map[string]any{"name": "cachedContents/upstream-id", "model": "models/gemini-2.5-flash", "expireTime": expiry.Format(time.RFC3339), "usageMetadata": map[string]any{"totalTokenCount": 2048}})
+					require.NoError(t, err)
+					_, _ = w.Write(response)
+				}))
+				defer server.Close()
+				channel := &model.Channel{Id: 7, Type: channelType, Status: common.ChannelStatusEnabled, Models: "alias", Group: "default", Key: "gateway-key", BaseURL: &server.URL, ModelMapping: common.GetPointer(`{"alias":"gemini-2.5-flash"}`), Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)}
+				if channelType == constant.ChannelTypeAdvancedCustom {
+					channel.OtherSettings = `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"/v1beta/models/{model}:generateContent"}]}}`
+					if auth == "google-key" {
+						channel.OtherSettings = strings.Replace(channel.OtherSettings, `"upstream_path"`, `"auth":{"type":"header","name":"x-goog-api-key","value":"{api_key}"},"upstream_path"`, 1)
+					}
+				}
+				provider, err := GeminiCacheProviderForChannel(channel, channel.Key, "alias")
+				require.NoError(t, err)
+				assert.Equal(t, server.URL+"/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", provider.GenerationURL("gemini-2.5-flash", true))
+				request, err := ParseGeminiCacheCreate([]byte(`{"model":"alias","contents":[{"parts":[{"text":"cached text"}]}]}`), expiry.Add(-time.Hour))
+				require.NoError(t, err)
+				count, err := CountGeminiCacheTokens(context.Background(), channel, channel.Key, request, "gemini-2.5-flash")
+				require.NoError(t, err)
+				assert.Equal(t, 2048, count)
+				resource, err := CreateGeminiCachedContent(context.Background(), channel, channel.Key, request, "gemini-2.5-flash")
+				require.NoError(t, err)
+				assert.Equal(t, "cachedContents/upstream-id", resource.Name)
+				assert.Equal(t, 2, calls)
+				record := &model.GeminiCachedContent{ChannelID: channel.Id, Group: "default", Model: "alias", UpstreamModel: "gemini-2.5-flash", BaseURL: provider.BindingURL, KeyFingerprint: GeminiCacheKeyFingerprint(channel.Key)}
+				_, _, err = GeminiCacheBinding(channel, record)
+				require.NoError(t, err)
+				channel.Type = constant.ChannelTypeGemini
+				_, _, err = GeminiCacheBinding(channel, record)
+				require.Error(t, err, "changing the authentication convention must invalidate the resource")
+			})
+		}
+	}
+}
+
+func TestGeminiCacheProviderRejectsUnsupportedConfiguration(t *testing.T) {
+	credentials := `{"project_id":"project-one","private_key":"private-key","client_email":"service@example.com"}`
+	vertex := model.Channel{Type: constant.ChannelTypeVertexAi, Status: common.ChannelStatusEnabled, Key: credentials, Other: `{"alias":"us-central1","default":"europe-west1"}`}
+	provider, err := GeminiCacheProviderForChannel(&vertex, credentials, "alias")
+	require.NoError(t, err)
+	assert.Equal(t, "https://us-central1-aiplatform.googleapis.com/v1/projects/project-one/locations/us-central1#gemini-cache:vertex-oauth", provider.BindingURL)
+	assert.Equal(t, "https://us-central1-aiplatform.googleapis.com/v1/projects/project-one/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent", provider.GenerationURL("gemini-2.5-flash", false))
+	for _, tc := range []struct {
+		name   string
+		change func(*model.Channel)
+	}{
+		{"global", func(c *model.Channel) { c.Other = "global" }},
+		{"unset region", func(c *model.Channel) { c.Other = "" }},
+		{"invalid region mapping", func(c *model.Channel) { c.Other = `{"alias":1}` }},
+		{"region path injection", func(c *model.Channel) { c.Other = "us-central1/../../other" }},
+		{"express mode", func(c *model.Channel) { c.OtherSettings = `{"vertex_key_type":"api_key"}` }},
+		{"malformed settings", func(c *model.Channel) { c.OtherSettings = "{" }},
+		{"project path injection", func(c *model.Channel) { c.Key = strings.Replace(c.Key, "project-one", "project/other", 1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := vertex
+			tc.change(&changed)
+			_, err := GeminiCacheProviderForChannel(&changed, changed.Key, "alias")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "private-key")
+		})
+	}
+	advanced := model.Channel{Type: constant.ChannelTypeAdvancedCustom, Status: common.ChannelStatusEnabled, BaseURL: common.GetPointer("https://gateway.example"), Key: "gateway-key", Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)}
+	for _, route := range []string{
+		`{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"https://other.example/v1beta/models/{model}:generateContent"}`,
+		`{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"/v1beta/models/{model}:generateContent","auth":{"type":"none"}}`,
+		`{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"/v1beta/models/{model}:generateContent","auth":{"type":"header","name":"Authorization","value":"Bearer fixed-account"}}`,
+		`{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"/v1/chat/completions","converter":"gemini_content_to_openai_chat"}`,
+	} {
+		advanced.OtherSettings = `{"advanced_custom":{"advanced_routes":[` + route + `]}}`
+		_, err := GeminiCacheProviderForChannel(&advanced, advanced.Key, "alias")
+		require.Error(t, err)
+	}
+	advanced.OtherSettings = `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1beta/models/{model}:generateContent","upstream_path":"/v1beta/models/{model}:generateContent"}]}}`
+	advanced.Setting = nil
+	_, err = GeminiCacheProviderForChannel(&advanced, advanced.Key, "alias")
+	require.Error(t, err, "native gateway capabilities require an explicit opt-in")
+}
+
+func TestGeminiCacheVertexProtocolBindingAndCleanup(t *testing.T) {
+	credentials, _ := vertexAuthTestCredentials(t)
+	authClient := vertexAuthTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"cached-vertex-token","token_type":"Bearer","expires_in":3600}`))
+	})
+	_, err := VertexAccessToken(context.Background(), credentials, authClient)
+	require.NoError(t, err)
+	encoded, err := common.Marshal(credentials)
+	require.NoError(t, err)
+	key := string(encoded)
+	expiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	upstreamName := "projects/123456789/locations/us-central1/cachedContents/upstream-id"
+	upstreamModel := "projects/123456789/locations/us-central1/publishers/google/models/gemini-2.5-flash"
+	var calls []string
+	invalidCreation := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		assert.Equal(t, "Bearer cached-vertex-token", r.Header.Get("Authorization"))
+		assert.Equal(t, credentials.ProjectID, r.Header.Get("x-goog-user-project"))
+		assert.Empty(t, r.Header.Get("x-goog-api-key"))
+		if r.Method == http.MethodDelete {
+			assert.Equal(t, "/v1/"+upstreamName, r.URL.Path)
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		var body map[string]common.RawMessage
+		if r.Method != http.MethodGet {
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+		}
+		if strings.HasSuffix(r.URL.Path, ":countTokens") {
+			assert.Equal(t, "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:countTokens", r.URL.Path)
+			assert.NotContains(t, body, "generateContentRequest")
+			assert.NotContains(t, body, "toolConfig")
+			assert.Contains(t, body, "tools")
+			assert.Equal(t, `"projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-flash"`, string(body["model"]))
+			_, _ = w.Write([]byte(`{"totalTokens":2048}`))
+			return
+		}
+		if r.Method == http.MethodPost {
+			assert.Equal(t, "/v1/projects/test-project/locations/us-central1/cachedContents", r.URL.Path)
+			assert.Equal(t, `"projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-flash"`, string(body["model"]))
+		} else {
+			assert.Equal(t, "/v1/"+upstreamName, r.URL.Path)
+		}
+		tokens := 2048
+		if invalidCreation {
+			tokens = -1
+		}
+		response, marshalErr := common.Marshal(map[string]any{"name": upstreamName, "model": upstreamModel, "expireTime": expiry.Format(time.RFC3339), "usageMetadata": map[string]any{"totalTokenCount": tokens}})
+		require.NoError(t, marshalErr)
+		_, _ = w.Write(response)
+	}))
+	defer server.Close()
+	channel := &model.Channel{Id: 8, Type: constant.ChannelTypeVertexAi, Status: common.ChannelStatusEnabled, BaseURL: &server.URL, Key: key, Other: `{"alias":"us-central1","default":"europe-west1"}`, Models: "alias", Group: "default", ModelMapping: common.GetPointer(`{"alias":"gemini-2.5-flash"}`)}
+	provider, err := GeminiCacheProviderForChannel(channel, key, "alias")
+	require.NoError(t, err)
+	request, err := ParseGeminiCacheCreate([]byte(`{"model":"alias","contents":[{"parts":[{"text":"cached text"}]}],"tools":[],"toolConfig":{}}`), expiry.Add(-time.Hour))
+	require.NoError(t, err)
+	count, err := CountGeminiCacheTokens(context.Background(), channel, key, request, "gemini-2.5-flash")
+	require.NoError(t, err)
+	assert.Equal(t, 2048, count)
+	resource, err := CreateGeminiCachedContent(context.Background(), channel, key, request, "gemini-2.5-flash")
+	require.NoError(t, err)
+	assert.Equal(t, upstreamName, resource.Name)
+	patch, err := ParseGeminiCachePatch([]byte(`{"expireTime":"`+expiry.Format(time.RFC3339)+`"}`), expiry.Add(-time.Hour))
+	require.NoError(t, err)
+	_, err = PatchGeminiCachedContent(context.Background(), channel, key, upstreamName, patch, "gemini-2.5-flash", "alias")
+	require.NoError(t, err)
+	_, err = GetGeminiCachedContentUpstream(context.Background(), channel, key, upstreamName, "gemini-2.5-flash", "alias")
+	require.NoError(t, err)
+	require.NoError(t, DeleteGeminiCachedContent(context.Background(), channel, key, upstreamName, "alias"))
+	invalidCreation = true
+	_, err = CreateGeminiCachedContent(context.Background(), channel, key, request, "gemini-2.5-flash")
+	require.Error(t, err)
+	assert.Equal(t, "DELETE /v1/"+upstreamName, calls[len(calls)-1])
+	assert.Len(t, calls, 7)
+	_, err = GetGeminiCachedContentUpstream(context.Background(), channel, key, "projects/123456789/locations/europe-west1/cachedContents/upstream-id", "gemini-2.5-flash", "alias")
+	require.Error(t, err)
+	assert.Len(t, calls, 7, "a different region must be rejected without contacting upstream")
+	record := &model.GeminiCachedContent{ChannelID: 8, Group: "default", Model: "alias", UpstreamModel: "gemini-2.5-flash", BaseURL: provider.BindingURL, KeyFingerprint: GeminiCacheKeyFingerprint(key)}
+	_, _, err = GeminiCacheBinding(channel, record)
+	require.NoError(t, err)
+	changedAuth := *channel
+	changedAuth.Type = constant.ChannelTypeGemini
+	changedAuth.BaseURL = common.GetPointer(strings.Split(provider.BindingURL, "#")[0])
+	changedAuth.Setting = common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)
+	_, _, err = GeminiCacheBinding(&changedAuth, record)
+	require.Error(t, err, "changing OAuth to API-key authentication cannot preserve a cache binding")
+	channel.Other = "europe-west1"
+	_, _, err = GeminiCacheBinding(channel, record)
+	require.Error(t, err, "a region change must invalidate a resource even with unchanged credentials")
 }

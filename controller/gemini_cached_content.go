@@ -124,7 +124,8 @@ func GeminiCachedContentCreate(c *gin.Context) {
 		geminiCacheControllerError(c, err)
 		return
 	}
-	base, err := service.GeminiCacheChannelBaseURL(channel)
+	key := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	provider, err := service.GeminiCacheProviderForChannel(channel, key, request.Model)
 	if err != nil {
 		geminiCacheControllerError(c, err)
 		return
@@ -134,7 +135,6 @@ func GeminiCachedContentCreate(c *gin.Context) {
 		geminiCacheControllerError(c, err)
 		return
 	}
-	key := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
 	// Reject missing pricing before sending even a countTokens request.
 	groupRatio := service.GetUserGroupRatio(c.GetString("user_group"), group)
 	if _, err = service.QuoteGeminiCacheBilling(request.Model, 1, request.ExpiresAt.Sub(started), service.GeminiCacheCreate, groupRatio); err != nil {
@@ -156,7 +156,7 @@ func GeminiCachedContentCreate(c *gin.Context) {
 		geminiCacheControllerError(c, err)
 		return
 	}
-	record := &model.GeminiCachedContent{PublicID: publicID, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), ChannelID: channel.Id, Group: group, KeyFingerprint: service.GeminiCacheKeyFingerprint(key), BaseURL: base, Model: request.Model, UpstreamModel: upstreamModel, DisplayName: request.DisplayName, TotalTokens: tokens, ExpiresAt: request.ExpiresAt.Unix()}
+	record := &model.GeminiCachedContent{PublicID: publicID, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), ChannelID: channel.Id, Group: group, KeyFingerprint: service.GeminiCacheKeyFingerprint(key), BaseURL: provider.BindingURL, Model: request.Model, UpstreamModel: upstreamModel, DisplayName: request.DisplayName, TotalTokens: tokens, ExpiresAt: request.ExpiresAt.Unix()}
 	billing, apiErr := service.NewGeminiCacheBillingSession(c, geminiCacheBillingInfo(c, record), quote)
 	if apiErr != nil {
 		geminiCacheControllerError(c, apiErr)
@@ -199,7 +199,7 @@ func GeminiCachedContentCreate(c *gin.Context) {
 		if !cleanup {
 			return
 		}
-		if err := service.DeleteGeminiCachedContent(context.WithoutCancel(ctx), channel, key, record.UpstreamName); err != nil {
+		if err := service.DeleteGeminiCachedContent(context.WithoutCancel(ctx), channel, key, record.UpstreamName, record.Model); err != nil {
 			retainReservation = true
 			billing.LogReconciliation(c, record.PublicID, "create_cleanup_failed")
 			return
@@ -402,7 +402,7 @@ func GeminiCachedContentPatch(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 90*time.Second)
 	defer cancel()
-	resource, err := service.PatchGeminiCachedContent(ctx, channel, key, record.UpstreamName, patch, record.UpstreamModel)
+	resource, err := service.PatchGeminiCachedContent(ctx, channel, key, record.UpstreamName, patch, record.UpstreamModel, record.Model)
 	var cacheErr *service.GeminiCacheError
 	if errors.As(err, &cacheErr) && !cacheErr.OutcomeUncertain {
 		// A definite rejection did not extend upstream storage.
@@ -418,7 +418,7 @@ func GeminiCachedContentPatch(c *gin.Context) {
 		oldExpiry := time.Unix(record.ExpiresAt, 0).UTC()
 		encoded, _ := common.Marshal(oldExpiry.Format(time.RFC3339))
 		old := &service.GeminiCachePatchRequest{Body: map[string]common.RawMessage{"expireTime": encoded}, ExpiresAt: oldExpiry, UpdateMask: "expireTime"}
-		restored, rollbackErr := service.PatchGeminiCachedContent(context.WithoutCancel(ctx), channel, key, record.UpstreamName, old, record.UpstreamModel)
+		restored, rollbackErr := service.PatchGeminiCachedContent(context.WithoutCancel(ctx), channel, key, record.UpstreamName, old, record.UpstreamModel, record.Model)
 		if rollbackErr == nil && restored.ExpireTime.Unix() == record.ExpiresAt {
 			_, _ = model.CancelGeminiCachedContentMutation(record.ID, record.MutationToken)
 		} else {
@@ -473,7 +473,7 @@ func GeminiCachedContentDelete(c *gin.Context) {
 	}
 	// Retain the lock on uncertain upstream failure. No generation can reuse a
 	// resource whose deletion may already have completed.
-	if err := service.DeleteGeminiCachedContent(context.WithoutCancel(c.Request.Context()), channel, key, record.UpstreamName); err != nil {
+	if err := service.DeleteGeminiCachedContent(context.WithoutCancel(c.Request.Context()), channel, key, record.UpstreamName, record.Model); err != nil {
 		var cacheErr *service.GeminiCacheError
 		if errors.As(err, &cacheErr) && !cacheErr.OutcomeUncertain {
 			_, _ = model.CancelGeminiCachedContentMutation(record.ID, record.MutationToken)

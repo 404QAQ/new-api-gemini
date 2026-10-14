@@ -94,7 +94,7 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 	case dto.FilterGeminiExternalCache:
 		return ch.Type != constant.ChannelTypeGemini
 	case dto.FilterGeminiExplicitCache:
-		_, supported := GeminiCacheChannelBaseURL(ch)
+		_, supported := GeminiCacheChannelConfigForModel(ch, modelName)
 		return supported
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {

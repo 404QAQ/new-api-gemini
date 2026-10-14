@@ -1,6 +1,6 @@
 ## Gemini 显式缓存扩展
 
-本仓库基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，增加 Gemini 缓存创建、查询、列表、续期、删除，以及原生普通/流式请求的缓存引用，包含令牌隔离、渠道与密钥绑定、独立计费。
+本仓库基于 [QuantumNous/new-api](https://github.com/QuantumNous/new-api)，增加 Gemini 缓存创建、查询、列表、续期、删除，以及原生 Gemini / OpenAI Chat 普通与流式请求的缓存引用。支持 AI Studio、Vertex 服务账号及具备原生 Gemini 缓存接口的中转，包含令牌隔离、渠道与密钥绑定、独立计费。
 
 **[使用说明、价格配置与调用示例](./GEMINI_CACHE.md)** · [上游项目](https://github.com/QuantumNous/new-api) · [AGPL-3.0 许可](./LICENSE)
 

@@ -145,3 +145,8 @@ gemini_cache.token_count_range: "cached content token count must be between 1 an
 gemini_cache.price_evaluation: "explicit cache price evaluation failed: {{.Error}}"
 gemini_cache.upstream_rejected: "Cached content upstream request rejected ({{.Status}})"
 gemini_cache.ownership_unavailable: "Unable to verify cached content ownership"
+
+gemini_cache.upstream_authentication: "Cached content upstream authentication failed"
+gemini_cache.openai_reference_field: "Use extra_body.google.cached_content for OpenAI cached content requests"
+gemini_cache.openai_immutable_fields: "OpenAI cached content cannot be combined with system or developer messages, tools or tool configuration"
+gemini_cache.openai_messages_required: "OpenAI cached content requires a non-empty messages array"

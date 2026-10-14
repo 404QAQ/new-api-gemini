@@ -2,12 +2,13 @@ package model
 
 import (
 	"errors"
-	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/relaykit/dto"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 const (
@@ -174,18 +175,26 @@ func SoftDeleteGeminiCachedContent(id int64, token string) (bool, error) {
 
 // GeminiCacheChannelBaseURL is shared by candidate selection and binding checks.
 func GeminiCacheChannelBaseURL(channel *Channel) (string, bool) {
-	if channel == nil || channel.Type != constant.ChannelTypeGemini || channel.Status != common.ChannelStatusEnabled {
+	if channel == nil || channel.Status != common.ChannelStatusEnabled {
+		return "", false
+	}
+	switch channel.Type {
+	case constant.ChannelTypeGemini, constant.ChannelTypeVertexAi, constant.ChannelTypeNewAPI, constant.ChannelTypeOpenAI, constant.ChannelTypeAdvancedCustom:
+	default:
 		return "", false
 	}
 	base := strings.TrimRight(strings.TrimSpace(channel.GetBaseURL()), "/")
-	if base == "" {
+	if base == "" && channel.Type == constant.ChannelTypeGemini {
 		base = constant.GetChannelBaseURL(constant.ChannelTypeGemini)
 	}
 	parsed, err := url.Parse(base)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" || strings.Contains(base, "\\") || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+	if base != "" && (err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" || strings.Contains(base, "\\") || (parsed.Scheme != "https" && parsed.Scheme != "http")) {
 		return "", false
 	}
-	official := parsed.Scheme == "https" && strings.EqualFold(parsed.Hostname(), "generativelanguage.googleapis.com") && (parsed.Port() == "" || parsed.Port() == "443") && parsed.Path == ""
+	if base == "" && channel.Type != constant.ChannelTypeVertexAi {
+		return "", false
+	}
+	official := channel.Type == constant.ChannelTypeGemini && parsed.Scheme == "https" && strings.EqualFold(parsed.Hostname(), "generativelanguage.googleapis.com") && (parsed.Port() == "" || parsed.Port() == "443") && parsed.Path == ""
 	settings := dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" && common.UnmarshalJsonStr(*channel.Setting, &settings) != nil {
 		return "", false
@@ -204,10 +213,100 @@ func GeminiCacheChannelBaseURL(channel *Channel) (string, bool) {
 			return "", false
 		}
 	}
-	if !official && !settings.GeminiExplicitCacheEnabled {
+	if channel.Type == constant.ChannelTypeVertexAi {
+		var other dto.ChannelOtherSettings
+		if channel.OtherSettings != "" && common.UnmarshalJsonStr(channel.OtherSettings, &other) != nil {
+			return "", false
+		}
+		if other.VertexKeyType == dto.VertexKeyTypeAPIKey {
+			return "", false
+		}
+	} else if !official && !settings.GeminiExplicitCacheEnabled {
 		return "", false
 	}
 	return base, true
+}
+
+// GeminiCacheChannelConfig contains the credential-independent provider policy.
+// Candidate selection and outbound requests share it so an unsupported channel
+// cannot shadow a usable channel merely through a higher routing priority.
+type GeminiCacheChannelConfig struct {
+	BaseURL    string
+	Region     string
+	AuthHeader string
+}
+
+var geminiCacheRegionPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+func GeminiCacheChannelConfigForModel(channel *Channel, localModel string) (*GeminiCacheChannelConfig, bool) {
+	base, supported := GeminiCacheChannelBaseURL(channel)
+	if !supported {
+		return nil, false
+	}
+	var other dto.ChannelOtherSettings
+	if channel.OtherSettings != "" && common.UnmarshalJsonStr(channel.OtherSettings, &other) != nil {
+		return nil, false
+	}
+	config := &GeminiCacheChannelConfig{BaseURL: base, AuthHeader: "x-goog-api-key"}
+	if channel.Type == constant.ChannelTypeGemini {
+		return config, true
+	}
+	config.AuthHeader = "Authorization"
+	if channel.Type == constant.ChannelTypeVertexAi {
+		region := strings.TrimSpace(channel.Other)
+		if strings.HasPrefix(region, "{") {
+			var regions map[string]string
+			if common.UnmarshalJsonStr(region, &regions) != nil {
+				return nil, false
+			}
+			region = strings.TrimSpace(regions[localModel])
+			if region == "" {
+				region = strings.TrimSpace(regions["default"])
+			}
+		}
+		// Vertex explicit caches are regional resources. Express mode is
+		// already excluded by the base eligibility check.
+		if region == "global" || !geminiCacheRegionPattern.MatchString(region) {
+			return nil, false
+		}
+		config.Region = region
+		return config, true
+	}
+	if channel.Type != constant.ChannelTypeAdvancedCustom {
+		return config, true
+	}
+	advanced := other.AdvancedCustom
+	if advanced == nil || advanced.Validate() != nil || localModel == "" || strings.ContainsAny(localModel, "/\\") {
+		return nil, false
+	}
+	for _, action := range []string{"generateContent", "streamGenerateContent"} {
+		route, found := advanced.MatchPathForModel("/v1beta/models/"+localModel+":"+action, localModel)
+		if !found || !route.IsNative() {
+			return nil, false
+		}
+		path := strings.TrimSpace(route.UpstreamPath)
+		if path != "/v1beta/models/{model}:"+action && !(action == "streamGenerateContent" && path == "/v1beta/models/{model}:generateContent") {
+			return nil, false
+		}
+		authHeader := "Authorization"
+		if auth := route.Auth; auth != nil {
+			if strings.TrimSpace(auth.Type) != dto.AdvancedCustomAuthTypeHeader {
+				return nil, false
+			}
+			switch {
+			case strings.EqualFold(strings.TrimSpace(auth.Name), "Authorization") && auth.Value == "Bearer {api_key}":
+			case strings.EqualFold(strings.TrimSpace(auth.Name), "x-goog-api-key") && auth.Value == "{api_key}":
+				authHeader = "x-goog-api-key"
+			default:
+				return nil, false
+			}
+		}
+		if action == "streamGenerateContent" && authHeader != config.AuthHeader {
+			return nil, false
+		}
+		config.AuthHeader = authHeader
+	}
+	return config, true
 }
 
 // GeminiCachedContentPublicIDExists includes expired and tombstoned bindings.

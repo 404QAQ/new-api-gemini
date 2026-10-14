@@ -1,6 +1,6 @@
 # new-api Gemini 显式缓存版
 
-本分支增加 Gemini 缓存的创建、查询、列表、续期和删除，并支持在原生 `generateContent` / `streamGenerateContent` 请求中引用缓存。缓存归属、固定渠道与密钥、创建和存储计费由 new-api 管理。
+本分支增加 Gemini 缓存的创建、查询、列表、续期和删除，并支持在原生 `generateContent` / `streamGenerateContent` 和 OpenAI `/v1/chat/completions` 请求中引用缓存。缓存归属、固定渠道与密钥、创建和存储计费由 new-api 管理。
 
 截至 2026-10-14，本地验证使用模拟上游；尚未用真实 Google API 验证，也未部署。
 
@@ -25,7 +25,7 @@ git clone https://github.com/404QAQ/new-api-gemini.git
 cd new-api-gemini
 (cd web && bun install --frozen-lockfile && bun run build:check)
 GOWORK=off go build -trimpath \
-  -ldflags '-X github.com/QuantumNous/new-api/common.Version=v1.0.0-rc.44-gemini-cache.1' \
+  -ldflags '-X github.com/QuantumNous/new-api/common.Version=v1.0.0-rc.44-gemini-cache.2' \
   -o new-api .
 ./new-api --port 3000
 ```
@@ -34,13 +34,31 @@ GOWORK=off go build -trimpath \
 
 ## 渠道与价格配置
 
-使用 Gemini 类型渠道。默认 Google 地址 `https://generativelanguage.googleapis.com` 可参与缓存选路；第三方 Gemini 兼容地址需要在渠道 `setting` JSON 内显式加入：
+支持范围如下。这里的“支持”表示已经实现并通过本地模拟协议测试，真实服务的模型可用性、最小 token 数和计费仍需使用测试账号核实。
+
+| 上游 / 入口 | 缓存创建管理与引用 | 配置要求 |
+| --- | --- | --- |
+| AI Studio / Gemini Developer API | 支持 | Gemini 类型渠道；默认官方地址可直接参与缓存选路 |
+| Vertex AI 服务账号 | 支持 | Vertex 类型渠道；服务账号 JSON；明确区域，如 `us-central1` |
+| Gemini 原生协议中转 | 支持 | Gemini、OpenAI、NewAPI 或受限的 AdvancedCustom 类型；开启下述兼容开关 |
+| OpenAI Chat 客户端 | 支持引用托管缓存 | 用统一缓存接口创建，再传 `extra_body.google.cached_content` |
+| Vertex Express API Key | 不支持缓存创建管理 | 当前官方 REST Discovery 没有 Express 顶层 `cachedContents` 接口 |
+| 仅提供 `/chat/completions` 的中转 | 不支持缓存创建管理 | 上游必须提供原生 Gemini 的计数、缓存和生成接口 |
+
+Gemini 默认地址 `https://generativelanguage.googleapis.com` 可直接参与缓存选路；第三方地址和 OpenAI / NewAPI / AdvancedCustom 类型需要在渠道 `setting` JSON 内显式加入：
 
 ```json
 {"gemini_explicit_cache_enabled": true}
 ```
 
 渠道管理 API 的 `setting` 字段是 JSON 字符串，例如 `"setting": "{\"gemini_explicit_cache_enabled\":true}"`；保存时合并已有配置。该开关不证明第三方支持缓存，需由管理员确认其 `countTokens`、缓存 CRUD 和生成接口兼容。缓存渠道不能设置系统提示词、参数覆盖或请求头覆盖。
+
+Gemini 类型向上游发送 `x-goog-api-key`；OpenAI / NewAPI 类型发送 `Authorization: Bearer <渠道 Key>`。这些兼容渠道的 Base URL 应为 API 根地址（可带网关路径前缀），不要追加 `/v1` 或 `/v1beta`；缓存和生成均走该地址下的 `/v1beta/...`。HTTP/SOCKS 代理沿用渠道代理设置。仅改变类型不会让上游自动支持缓存。
+
+Vertex 服务账号从当前选中凭据取得项目，区域取渠道 `other`。可填写 `us-central1`，也可填写 `{"gemini-2.5-flash":"us-central1","default":"europe-west4"}`；按客户端模型名选区域。缓存使用 Vertex `v1` 项目区域接口，返回的项目数字标识会原样绑定。缺省/global 区域和 Express API Key 会被拒绝。自定义 Vertex Base URL 沿用原项目的规则：填写主机根或以 `/v1` 结尾的根，不填写 project/location。创建后改变项目、区域、凭据、认证模式或地址会使旧绑定不可用。
+
+AdvancedCustom 仅接受匹配当前模型的标准原生生成与流式路由：`/v1beta/models/{model}:generateContent` 和 `/v1beta/models/{model}:streamGenerateContent`，上游路径使用相同模板（流式路由也可映射至 generateContent，由缓存适配器切换流式动作）。认证使用默认 Bearer，或固定的 `Authorization: Bearer {api_key}` / `x-goog-api-key: {api_key}` 请求头模板。任意绝对 URL、协议转换、无认证、查询参数认证或固定其他账号的模板均不受支持。OpenAI Chat 引用托管缓存时，使用这套原生路由。
+
 
 除正常生成模型价格外，还必须为客户端使用的模型名配置两个独立计费名。若请求模型为 `gemini-2.5-flash`，在 `billing_setting.billing_mode` 中将以下两项设为 `tiered_expr`，并在 `billing_setting.billing_expr` 中保存对应表达式：
 
@@ -100,15 +118,27 @@ curl --fail-with-body -sS -X DELETE "$NEW_API_BASE/v1beta/$CACHE_NAME" \
 
 流式生成把生成 URL 改为 `:streamGenerateContent?alt=sse`，并给 curl 加 `-N`。分页时将列表响应的 `nextPageToken` 原样传入下一次请求的 `pageToken`。
 
+同一个缓存也可从 OpenAI Chat 入口引用；创建、续期和删除仍使用上面的统一 `/v1beta/cachedContents` 接口：
+
+```sh
+jq -n --arg model "$GEMINI_MODEL" --arg cache "$CACHE_NAME" \
+  '{model:$model, messages:[{role:"user",content:"请概括以上材料的重点"}], extra_body:{google:{cached_content:$cache}}}' |
+curl --fail-with-body -sS "$NEW_API_BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @-
+```
+
+将 JSON 中的 `stream` 设为 `true` 即返回 OpenAI 格式 SSE。OpenAI Python SDK 会展平调用参数 `extra_body`，所以 SDK 写法为 `extra_body={"extra_body":{"google":{"cached_content": CACHE_NAME}}}`；实际 HTTP JSON 使用上例的一层 `extra_body`。不要再次发送 system/developer 消息、tools/functions 或工具选择配置，这些不可变信息应在创建缓存时确定。工具调用结果可以作为新的对话内容继续发送。
+
 ## 绑定与限制
 
 - 缓存绑定创建者、new-api 令牌 ID、实际分组、渠道、上游密钥指纹、Base URL 和模型映射。同一用户的另一枚令牌也不能使用；多密钥渠道调整顺序仍能找到原密钥，原密钥移除或禁用后拒绝使用，不能切换密钥或渠道重试。
 - 本地托管缓存仅使用返回的 `cachedContents/...` 公开名称，Gemini API Key 渠道不能直接提交 Google 原始资源名。数据库保存资源绑定与用量元数据，不在缓存表保存提示词正文或明文上游密钥。查询和列表读取本地记录，不枚举上游账户的全部缓存。
 - 创建默认有效期一小时；可指定 `ttl` 或 RFC3339 `expireTime`，两者不能并存。范围为 1 秒到 24 小时，向上取整至整秒。PATCH 仅允许修改这两个过期字段之一。
 - 缓存请求体上限 32 MiB，缓存 token 数上限 2,000,000；上游还可能有更严格的模型、最小 token 数或模态限制。重复 JSON 字段、蛇形别名和服务端管理字段会被拒绝。
-- 引用缓存时不能同时发送 `systemInstruction`、`tools` 或 `toolConfig`；这些配置应在创建时确定。托管缓存引用仅支持原生 Gemini 的生成和流式生成，未扩展 OpenAI/Anthropic 协议或客户端缓存 `countTokens`。
-- Vertex 的 `projects/.../locations/.../cachedContents/...` 完整资源引用保留既有 Vertex 路由行为；本版本不新增这些缓存的创建、管理和存储计费，生成仍走既有计费流程。
-- NewAPI、AdvancedCustom 等其他类型渠道保留外部缓存引用；这些引用不会分配给 Gemini API Key 渠道。若资源名在本地缓存表存在，无论状态或归属如何，均必须通过本地权限校验，不能回退为外部引用。
+- 引用缓存时不能同时发送 `systemInstruction`、`tools` 或 `toolConfig`；这些配置应在创建时确定。托管缓存引用支持原生 Gemini 和 OpenAI Chat 的普通/流式生成，未扩展 Anthropic、Responses 或客户端缓存 `countTokens`。渠道或全局的请求体透传、Chat→Responses 设置不能绕过托管缓存的原生转换与最终校验。
+- Vertex 通过本地缓存接口创建时，对客户端仍返回不透明的 `cachedContents/...` 名称，服务端转换为真实项目区域资源名。原生入口直接传入外部 Vertex 完整资源名仍保留既有路由行为，但不由本功能负责创建管理或存储计费。
+- 原生入口在 NewAPI、AdvancedCustom 等其他类型渠道保留外部缓存引用；这些引用不会分配给 Gemini API Key 渠道。若资源名在本地缓存表存在，无论状态或归属如何，均必须通过本地权限校验，不能回退为外部引用。OpenAI Chat 入口只接受当前令牌创建的本地托管缓存。
 - 不自动提取公共前缀创建缓存，不做隐式缓存管理、自动续期或跨令牌共享。
 
 ## 失败处理与验证边界
@@ -117,4 +147,16 @@ curl --fail-with-body -sS -X DELETE "$NEW_API_BASE/v1beta/$CACHE_NAME" \
 
 当前没有自动对账任务，也不提供严格的跨进程崩溃恢复或请求幂等保证。遇到上述日志或长期停留在 pending/mutating 状态的记录，应由管理员核对上游资源、额度预留及消费日志；不要直接解锁记录、反复创建或自行退款。
 
-已完成的验证包括模拟上游生命周期、流式/非流式引用、权限隔离、固定密钥、计费及补偿路径，以及真实 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 16.13 的专项验证。该结果不代表已通过真实 Google API 或全部最低数据库版本验证。发布前仍需用独立测试账户核实真实上游的请求格式、可缓存模型、计费结果及异常补偿。
+已完成的验证包括模拟上游生命周期、流式/非流式引用、权限隔离、固定密钥、计费及补偿路径，以及真实 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 16.13 的专项验证。该结果不代表已通过真实 Google API 或全部最低数据库版本验证。生产使用前仍需用独立测试账户核实真实上游的请求格式、可缓存模型、计费结果及异常补偿。
+
+## 本次扩展的协议依据
+
+Vertex 计数请求直接包含 `contents` / `systemInstruction` / `tools`，不使用 AI Studio 的 `generateContentRequest` 包装；缓存创建模型名使用完整的项目、区域和 publisher 路径。OAuth token 缓存按凭据指纹隔离，渠道多 Key 重排不会命中另一账号的旧 token；OAuth 使用固定 Google 地址、强制证书验证和禁止重定向。
+
+- [Vertex 缓存服务](https://github.com/googleapis/googleapis/blob/master/google/cloud/aiplatform/v1/gen_ai_cache_service.proto)
+- [Vertex countTokens 契约](https://github.com/googleapis/googleapis/blob/master/google/cloud/aiplatform/v1/prediction_service.proto)
+- [Vertex REST Discovery](https://github.com/googleapis/google-api-go-client/blob/main/aiplatform/v1/aiplatform-api.json)
+- [Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai)
+- [Vertex OpenAI 缓存示例](https://github.com/GoogleCloudPlatform/generative-ai/blob/main/gemini/chat-completions/intro_chat_completions_api.ipynb)
+
+认证变更参照 OWASP Authentication、Session Management、OAuth2 Cheat Sheets 和 ASVS 5.0 的 JWT、TLS 相关控制，回归覆盖 token 身份隔离、过期、重定向、全局 insecure 配置、敏感信息脱敏及取消；这不表示整个项目已经完成 ASVS 合规认证。

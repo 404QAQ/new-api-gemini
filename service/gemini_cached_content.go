@@ -259,8 +259,13 @@ func ValidateGeminiCacheReference(body []byte) (string, error) {
 		return "", err
 	}
 	objects := []map[string]common.RawMessage{fields}
-	if _, exists := fields["generate_content_request"]; exists {
-		return "", geminiCacheInvalid("Use generateContentRequest instead of generate_content_request")
+	for field := range fields {
+		if strings.EqualFold(field, "generate_content_request") {
+			return "", geminiCacheInvalid("Use generateContentRequest instead of generate_content_request")
+		}
+		if strings.EqualFold(field, "generateContentRequest") && field != "generateContentRequest" {
+			return "", geminiCacheInvalid("Invalid cached content request")
+		}
 	}
 	if nested, present := fields["generateContentRequest"]; present {
 		var nestedFields map[string]common.RawMessage
@@ -271,8 +276,13 @@ func ValidateGeminiCacheReference(body []byte) (string, error) {
 	}
 	name := ""
 	for _, object := range objects {
-		if _, exists := object["cached_content"]; exists {
-			return "", geminiCacheInvalid("Use cachedContent instead of cached_content")
+		for field := range object {
+			if strings.EqualFold(field, "cached_content") {
+				return "", geminiCacheInvalid("Use cachedContent instead of cached_content")
+			}
+			if strings.EqualFold(field, "cachedContent") && field != "cachedContent" {
+				return "", geminiCacheInvalid("Invalid cached content request")
+			}
 		}
 		if raw, exists := object["cachedContent"]; exists {
 			var current string
@@ -287,9 +297,11 @@ func ValidateGeminiCacheReference(body []byte) (string, error) {
 	}
 	if name != "" {
 		for _, object := range objects {
-			for _, field := range []string{"systemInstruction", "system_instruction", "tools", "toolConfig", "tool_config"} {
-				if _, exists := object[field]; exists {
-					return "", geminiCacheInvalid("cachedContent cannot be combined with systemInstruction, tools or toolConfig")
+			for field := range object {
+				for _, immutable := range []string{"systemInstruction", "system_instruction", "tools", "toolConfig", "tool_config"} {
+					if strings.EqualFold(field, immutable) {
+						return "", geminiCacheInvalid("cachedContent cannot be combined with systemInstruction, tools or toolConfig")
+					}
 				}
 			}
 		}
@@ -299,7 +311,8 @@ func ValidateGeminiCacheReference(body []byte) (string, error) {
 
 // HasGeminiCacheReference is a cheap, duplicate-safe preflight used by the
 // relay middleware. It avoids imposing strict cache validation limits on every
-// ordinary Gemini request while still recognizing escaped and nested aliases.
+// ordinary Gemini request while recognizing escaped, nested and case-folded
+// aliases accepted by struct decoders. The full validator rejects these aliases.
 func HasGeminiCacheReference(body []byte) bool {
 	root := gjson.ParseBytes(body)
 	if !root.IsObject() {
@@ -307,13 +320,14 @@ func HasGeminiCacheReference(body []byte) bool {
 	}
 	found := false
 	root.ForEach(func(key, child gjson.Result) bool {
-		switch key.String() {
-		case "cachedContent", "cached_content":
+		field := key.String()
+		switch {
+		case strings.EqualFold(field, "cachedContent"), strings.EqualFold(field, "cached_content"):
 			found = true
-		case "generateContentRequest", "generate_content_request":
+		case strings.EqualFold(field, "generateContentRequest"), strings.EqualFold(field, "generate_content_request"):
 			if child.IsObject() {
 				child.ForEach(func(nestedKey, _ gjson.Result) bool {
-					if nestedKey.String() == "cachedContent" || nestedKey.String() == "cached_content" {
+					if strings.EqualFold(nestedKey.String(), "cachedContent") || strings.EqualFold(nestedKey.String(), "cached_content") {
 						found = true
 					}
 					return !found
@@ -336,7 +350,8 @@ func GeminiCacheReferenceInReader(input io.Reader) (bool, error) {
 
 // GeminiCacheReferenceNameInReader reads only bounded protocol resource names.
 // It checks every occurrence to prevent duplicate or nested fields selecting a
-// different account policy than the eventual request decoder.
+// different account policy than the eventual request decoder, including its
+// case-insensitive field matching.
 func GeminiCacheReferenceNameInReader(input io.Reader) (string, error) {
 	_, name, err := scanGeminiCacheReference(input, true)
 	return name, err
@@ -399,8 +414,8 @@ func scanGeminiCacheReference(input io.Reader, captureName bool) (bool, string, 
 				}
 				continue
 			}
-			switch key {
-			case "cachedContent", "cached_content":
+			switch {
+			case strings.EqualFold(key, "cachedContent"), strings.EqualFold(key, "cached_content"):
 				if !captureName {
 					return true, "", nil
 				}
@@ -420,11 +435,14 @@ func scanGeminiCacheReference(input io.Reader, captureName bool) (bool, string, 
 				if nameErr != nil || name == "" {
 					return false, "", geminiCacheInvalid("cachedContent must be a resource name")
 				}
-				if reference != "" && reference != name {
-					return false, "", geminiCacheInvalid("Conflicting cachedContent references")
+				if reference != "" {
+					if reference != name {
+						return false, "", geminiCacheInvalid("Conflicting cachedContent references")
+					}
+					return false, "", geminiCacheInvalid("Duplicate JSON fields are not supported")
 				}
 				reference = name
-			case "generateContentRequest", "generate_content_request":
+			case strings.EqualFold(key, "generateContentRequest"), strings.EqualFold(key, "generate_content_request"):
 				pendingRequest = depth == 1
 			}
 		default:
@@ -532,8 +550,7 @@ func GeminiCacheBinding(channel *model.Channel, record *model.GeminiCachedConten
 	if record == nil || channel == nil || channel.Id != record.ChannelID {
 		return "", 0, geminiCacheUnavailable()
 	}
-	base, err := GeminiCacheChannelBaseURL(channel)
-	if err != nil || base != record.BaseURL || !slices.Contains(strings.Split(channel.Group, ","), record.Group) {
+	if !slices.Contains(strings.Split(channel.Group, ","), record.Group) {
 		return "", 0, geminiCacheUnavailable()
 	}
 	upstreamModel, err := GeminiCacheUpstreamModel(channel, record.Model)
@@ -551,19 +568,16 @@ func GeminiCacheBinding(channel *model.Channel, record *model.GeminiCachedConten
 		if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; channel.ChannelInfo.IsMultiKey && exists && status != common.ChannelStatusEnabled {
 			continue
 		}
+		provider, err := GeminiCacheProviderForChannel(channel, key, record.Model)
+		if err != nil || provider.BindingURL != record.BaseURL {
+			return "", 0, geminiCacheUnavailable()
+		}
 		return key, index, nil
 	}
 	return "", 0, geminiCacheUnavailable()
 }
 
-func geminiCacheUpstreamRequest(ctx context.Context, channel *model.Channel, key, method, resource string, payload any, mutation bool) ([]byte, error) {
-	base, err := GeminiCacheChannelBaseURL(channel)
-	if err != nil {
-		return nil, err
-	}
-	if key == "" || strings.ContainsAny(key, "\r\n") {
-		return nil, geminiCacheUnavailable()
-	}
+func geminiCacheUpstreamRequest(ctx context.Context, provider *GeminiCacheProvider, method, resource string, payload any, mutation bool) ([]byte, error) {
 	body, err := common.Marshal(payload)
 	if err != nil {
 		return nil, geminiCacheInvalid("Unable to encode cached content request")
@@ -577,13 +591,15 @@ func geminiCacheUpstreamRequest(ctx context.Context, channel *model.Channel, key
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, method, base+"/v1beta/"+resource, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, method, provider.apiRoot+"/"+resource, bytes.NewReader(body))
 	if err != nil {
 		return nil, geminiCacheUnavailable()
 	}
-	request.Header.Set("x-goog-api-key", key)
+	if err := provider.SetupHeader(ctx, &request.Header); err != nil {
+		return nil, err
+	}
 	request.Header.Set("Content-Type", "application/json")
-	settings := channel.GetSetting()
+	settings := provider.settings
 	client, err := GetHttpClientWithProxySettings(settings.Proxy, settings)
 	if err != nil {
 		return nil, geminiCacheUnavailable()
@@ -632,14 +648,25 @@ func CountGeminiCacheTokens(ctx context.Context, channel *model.Channel, key str
 	if request == nil || !geminiCacheModelPattern.MatchString(upstreamModel) {
 		return 0, geminiCacheInvalid("Invalid cached content request")
 	}
+	provider, err := GeminiCacheProviderForChannel(channel, key, request.Model)
+	if err != nil {
+		return 0, err
+	}
 	generate := make(map[string]common.RawMessage)
 	for _, field := range []string{"contents", "systemInstruction", "tools", "toolConfig"} {
+		if provider.vertex && field == "toolConfig" {
+			continue
+		}
 		if value, exists := request.Body[field]; exists {
 			generate[field] = value
 		}
 	}
-	generate["model"], _ = common.Marshal("models/" + upstreamModel)
-	response, err := geminiCacheUpstreamRequest(ctx, channel, key, http.MethodPost, "models/"+upstreamModel+":countTokens", map[string]any{"generateContentRequest": generate}, false)
+	generate["model"], _ = common.Marshal(provider.modelRoot + upstreamModel)
+	var payload any = map[string]any{"generateContentRequest": generate}
+	if provider.vertex {
+		payload = generate
+	}
+	response, err := geminiCacheUpstreamRequest(ctx, provider, http.MethodPost, provider.modelRoot+upstreamModel+":countTokens", payload, false)
 	if err != nil {
 		return 0, err
 	}
@@ -652,7 +679,7 @@ func CountGeminiCacheTokens(ctx context.Context, channel *model.Channel, key str
 	return *result.TotalTokens, nil
 }
 
-func parseGeminiCacheUpstreamResource(body []byte, upstreamModel string) (*GeminiCacheUpstreamResource, error) {
+func parseGeminiCacheUpstreamResource(body []byte, upstreamModel string, provider *GeminiCacheProvider) (*GeminiCacheUpstreamResource, error) {
 	var response struct {
 		Name          string `json:"name"`
 		Model         string `json:"model"`
@@ -662,7 +689,7 @@ func parseGeminiCacheUpstreamResource(body []byte, upstreamModel string) (*Gemin
 			TotalTokenCount *int `json:"totalTokenCount"`
 		} `json:"usageMetadata"`
 	}
-	if common.Unmarshal(body, &response) != nil || !geminiCacheUpstreamNamePattern.MatchString(response.Name) || strings.TrimPrefix(response.Model, "models/") != upstreamModel || response.UsageMetadata.TotalTokenCount == nil || *response.UsageMetadata.TotalTokenCount < 1 || *response.UsageMetadata.TotalTokenCount > GeminiCacheMaxTokens {
+	if common.Unmarshal(body, &response) != nil || !provider.validResourceName(response.Name) || !provider.validResourceModel(response.Model, upstreamModel) || response.UsageMetadata.TotalTokenCount == nil || *response.UsageMetadata.TotalTokenCount < 1 || *response.UsageMetadata.TotalTokenCount > GeminiCacheMaxTokens {
 		return nil, geminiCacheBadUpstream()
 	}
 	expiry, err := time.Parse(time.RFC3339Nano, response.ExpireTime)
@@ -676,13 +703,17 @@ func CreateGeminiCachedContent(ctx context.Context, channel *model.Channel, key 
 	if request == nil || !geminiCacheModelPattern.MatchString(upstreamModel) {
 		return nil, geminiCacheInvalid("Invalid cached content request")
 	}
-	payload := maps.Clone(request.Body)
-	payload["model"], _ = common.Marshal("models/" + upstreamModel)
-	body, err := geminiCacheUpstreamRequest(ctx, channel, key, http.MethodPost, "cachedContents", payload, false)
+	provider, err := GeminiCacheProviderForChannel(channel, key, request.Model)
 	if err != nil {
 		return nil, err
 	}
-	resource, validationErr := parseGeminiCacheUpstreamResource(body, upstreamModel)
+	payload := maps.Clone(request.Body)
+	payload["model"], _ = common.Marshal(provider.modelRoot + upstreamModel)
+	body, err := geminiCacheUpstreamRequest(ctx, provider, http.MethodPost, provider.resourceRoot+"cachedContents", payload, false)
+	if err != nil {
+		return nil, err
+	}
+	resource, validationErr := parseGeminiCacheUpstreamResource(body, upstreamModel, provider)
 	if validationErr == nil && resource.ExpireTime.After(request.ExpiresAt) {
 		validationErr = geminiCacheBadUpstream()
 	}
@@ -694,24 +725,32 @@ func CreateGeminiCachedContent(ctx context.Context, channel *model.Channel, key 
 			Name string `json:"name"`
 		}
 		cacheErr := &GeminiCacheError{HTTPStatus: http.StatusBadGateway, Status: "INTERNAL", Message: "Invalid cached content response from upstream", OutcomeUncertain: true}
-		if common.Unmarshal(body, &partial) == nil && geminiCacheUpstreamNamePattern.MatchString(partial.Name) {
+		if common.Unmarshal(body, &partial) == nil && provider.validResourceName(partial.Name) {
 			cacheErr.UpstreamName = partial.Name
-			cacheErr.OutcomeUncertain = DeleteGeminiCachedContent(context.WithoutCancel(ctx), channel, key, partial.Name) != nil
+			cacheErr.OutcomeUncertain = DeleteGeminiCachedContent(context.WithoutCancel(ctx), channel, key, partial.Name, request.Model) != nil
 		}
 		return nil, cacheErr
 	}
 	return resource, nil
 }
 
-func PatchGeminiCachedContent(ctx context.Context, channel *model.Channel, key, upstreamName string, patch *GeminiCachePatchRequest, upstreamModel string) (*GeminiCacheUpstreamResource, error) {
-	if patch == nil || !geminiCacheUpstreamNamePattern.MatchString(upstreamName) {
-		return nil, geminiCacheInvalid("Invalid cached content update")
+func PatchGeminiCachedContent(ctx context.Context, channel *model.Channel, key, upstreamName string, patch *GeminiCachePatchRequest, upstreamModel string, localModels ...string) (*GeminiCacheUpstreamResource, error) {
+	localModel := upstreamModel
+	if len(localModels) > 0 {
+		localModel = localModels[0]
 	}
-	body, err := geminiCacheUpstreamRequest(ctx, channel, key, http.MethodPatch, upstreamName+"?updateMask=expireTime", patch.Body, true)
+	provider, err := GeminiCacheProviderForChannel(channel, key, localModel)
 	if err != nil {
 		return nil, err
 	}
-	resource, err := parseGeminiCacheUpstreamResource(body, upstreamModel)
+	if patch == nil || !provider.validResourceName(upstreamName) {
+		return nil, geminiCacheInvalid("Invalid cached content update")
+	}
+	body, err := geminiCacheUpstreamRequest(ctx, provider, http.MethodPatch, upstreamName+"?updateMask=expireTime", patch.Body, true)
+	if err != nil {
+		return nil, err
+	}
+	resource, err := parseGeminiCacheUpstreamResource(body, upstreamModel, provider)
 	if err == nil && (resource.Name != upstreamName || resource.ExpireTime.After(patch.ExpiresAt)) {
 		err = geminiCacheBadUpstream()
 	}
@@ -721,26 +760,42 @@ func PatchGeminiCachedContent(ctx context.Context, channel *model.Channel, key, 
 	return resource, err
 }
 
-func GetGeminiCachedContentUpstream(ctx context.Context, channel *model.Channel, key, upstreamName, upstreamModel string) (*GeminiCacheUpstreamResource, error) {
-	if !geminiCacheUpstreamNamePattern.MatchString(upstreamName) {
-		return nil, geminiCacheUnavailable()
+func GetGeminiCachedContentUpstream(ctx context.Context, channel *model.Channel, key, upstreamName, upstreamModel string, localModels ...string) (*GeminiCacheUpstreamResource, error) {
+	localModel := upstreamModel
+	if len(localModels) > 0 {
+		localModel = localModels[0]
 	}
-	body, err := geminiCacheUpstreamRequest(ctx, channel, key, http.MethodGet, upstreamName, nil, true)
+	provider, err := GeminiCacheProviderForChannel(channel, key, localModel)
 	if err != nil {
 		return nil, err
 	}
-	resource, err := parseGeminiCacheUpstreamResource(body, upstreamModel)
+	if !provider.validResourceName(upstreamName) {
+		return nil, geminiCacheUnavailable()
+	}
+	body, err := geminiCacheUpstreamRequest(ctx, provider, http.MethodGet, upstreamName, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	resource, err := parseGeminiCacheUpstreamResource(body, upstreamModel, provider)
 	if err == nil && resource.Name != upstreamName {
 		return nil, geminiCacheBadUpstream()
 	}
 	return resource, err
 }
 
-func DeleteGeminiCachedContent(ctx context.Context, channel *model.Channel, key, upstreamName string) error {
-	if !geminiCacheUpstreamNamePattern.MatchString(upstreamName) {
+func DeleteGeminiCachedContent(ctx context.Context, channel *model.Channel, key, upstreamName string, localModels ...string) error {
+	localModel := ""
+	if len(localModels) > 0 {
+		localModel = localModels[0]
+	}
+	provider, err := GeminiCacheProviderForChannel(channel, key, localModel)
+	if err != nil {
+		return err
+	}
+	if !provider.validResourceName(upstreamName) {
 		return geminiCacheUnavailable()
 	}
-	_, err := geminiCacheUpstreamRequest(ctx, channel, key, http.MethodDelete, upstreamName, nil, true)
+	_, err = geminiCacheUpstreamRequest(ctx, provider, http.MethodDelete, upstreamName, nil, true)
 	var apiErr *GeminiCacheError
 	if errors.As(err, &apiErr) && apiErr.HTTPStatus == http.StatusNotFound {
 		return nil
