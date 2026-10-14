@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/vertex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/sjson"
@@ -25,7 +26,9 @@ import (
 // The provider owns the endpoint and credentials used by both CRUD and reuse.
 type geminiCacheAdaptor struct {
 	gemini.Adaptor
-	provider *service.GeminiCacheProvider
+	provider       *service.GeminiCacheProvider
+	requestStarted bool
+	automatic      bool
 }
 
 func (a *geminiCacheAdaptor) Init(info *relaycommon.RelayInfo) {
@@ -124,5 +127,19 @@ func (a *geminiCacheAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayIn
 		return nil, err
 	}
 	defer closer.Close()
+	// Once transport preparation starts, a transport error cannot prove that
+	// upstream generation did not run. Automatic caching only falls back on
+	// failures from the binding/body validation above this point.
+	a.requestStarted = true
 	return channel.DoApiRequest(a, c, info, outbound)
+}
+
+func (a *geminiCacheAdaptor) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+	usage, apiErr := a.Adaptor.DoResponse(c, response, info)
+	if a.automatic && apiErr != nil {
+		// A 200 response may already represent a paid generation, even if its
+		// body is truncated or invalid. Never submit it again on another channel.
+		apiErr = types.NewError(apiErr, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+	}
+	return usage, apiErr
 }

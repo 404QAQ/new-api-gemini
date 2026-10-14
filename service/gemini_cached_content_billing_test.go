@@ -3,15 +3,21 @@ package service
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/gin-gonic/gin"
@@ -275,6 +281,162 @@ func TestGeminiCacheBillingDatabaseMatrix(t *testing.T) {
 					assert.Equal(t, tc.wallet-tc.wantCharge, actualUser.Quota, fmt.Sprintf("wallet after %s", tc.name))
 					assert.Equal(t, tc.token-tc.wantCharge, actualToken.RemainQuota)
 				})
+			}
+			t.Run("automatic cache keeps generation billing independent", func(t *testing.T) {
+				runGeminiAutoCacheBillingCases(t, db)
+			})
+		})
+	}
+}
+
+func runGeminiAutoCacheBillingCases(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&model.GeminiCachedContent{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousExpression := settings.BillingExpr["cache-test-cache-create"]
+	settings.BillingExpr["cache-test-cache-create"] = `tier("cache_create", p * 1)`
+	t.Cleanup(func() { settings.BillingExpr["cache-test-cache-create"] = previousExpression })
+	for _, tc := range []struct {
+		name         string
+		subscription bool
+		insufficient bool
+	}{
+		{name: "wallet charges cache and generation separately"},
+		{name: "subscription uses independent reservation IDs", subscription: true},
+		{name: "insufficient wallet preserves generation reservation", insufficient: true},
+		{name: "insufficient subscription preserves generation reservation", subscription: true, insufficient: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			balance := 10000
+			if tc.insufficient {
+				balance = 400
+			}
+			user := model.User{Username: "auto-cache-" + common.GetUUID(), AffCode: common.GetUUID(), Quota: balance, Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: common.GetUUID(), Name: "auto-cache-test", RemainQuota: 10000, Status: common.TokenStatusEnabled}
+			require.NoError(t, db.Create(&token).Error)
+			expiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+			var createCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, ":countTokens") {
+					_, _ = w.Write([]byte(`{"totalTokens":1000}`))
+					return
+				}
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.Equal(t, "/v1beta/cachedContents", r.URL.Path)
+				createCalls.Add(1)
+				_, _ = fmt.Fprintf(w, `{"name":"cachedContents/automatic","model":"models/cache-test","expireTime":%q,"usageMetadata":{"totalTokenCount":1000}}`, expiry.Format(time.RFC3339))
+			}))
+			t.Cleanup(server.Close)
+			channel := model.Channel{Type: constant.ChannelTypeGemini, Name: "auto-cache-test", Key: "test-upstream-key", Models: "cache-test", Group: "default", Status: common.ChannelStatusEnabled, BaseURL: &server.URL, Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)}
+			require.NoError(t, db.Create(&channel).Error)
+			t.Cleanup(func() {
+				require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.Log{}).Error)
+				require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.GeminiCachedContent{}).Error)
+				require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.SubscriptionPreConsumeRecord{}).Error)
+				require.NoError(t, db.Delete(&token).Error)
+				require.NoError(t, db.Delete(&user).Error)
+				require.NoError(t, db.Delete(&channel).Error)
+			})
+			preference := "wallet_only"
+			var subscription model.UserSubscription
+			if tc.subscription {
+				preference = "subscription_only"
+				plan := model.SubscriptionPlan{Title: "auto-cache-plan", QuotaResetPeriod: model.SubscriptionResetNever}
+				require.NoError(t, db.Create(&plan).Error)
+				subscription = model.UserSubscription{UserId: user.Id, PlanId: plan.Id, AmountTotal: int64(balance), Status: "active", StartTime: time.Now().Add(-time.Hour).Unix(), EndTime: time.Now().Add(24 * time.Hour).Unix()}
+				require.NoError(t, db.Create(&subscription).Error)
+				t.Cleanup(func() {
+					require.NoError(t, db.Delete(&subscription).Error)
+					require.NoError(t, db.Delete(&plan).Error)
+				})
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/cache-test:streamGenerateContent", nil)
+			ctx.Set("token_name", token.Name)
+			ctx.Set(common.RequestIdKey, "generation-"+common.GetUUID())
+			common.SetContextKey(ctx, constant.ContextKeyUserId, user.Id)
+			common.SetContextKey(ctx, constant.ContextKeyTokenId, token.Id)
+			common.SetContextKey(ctx, constant.ContextKeyTokenKey, token.Key)
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "cache-test")
+			common.SetContextKey(ctx, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: preference, QuotaWarningThreshold: -1})
+			common.SetContextKey(ctx, constant.ContextKeyChannelId, channel.Id)
+			common.SetContextKey(ctx, constant.ContextKeyChannelType, channel.Type)
+			generation := relaycommon.GenRelayInfoGemini(ctx, nil)
+			generation.InitChannelMeta(ctx)
+			generation.IsStream, generation.ForcePreConsume = true, true
+			common.SetContextKey(ctx, constant.ContextKeyIsStream, true)
+			generation.PriceData.GroupRatioInfo.GroupRatio = 1
+			generation.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ExprString: `tier("generation", p * 1)`, QuotaPerUnit: common.QuotaPerUnit, GroupRatio: 1, EstimatedQuotaAfterGroup: 200}
+			require.Nil(t, PreConsumeBilling(ctx, 200, generation))
+			generationBilling := generation.Billing
+			request, err := ParseGeminiCacheCreate([]byte(`{"model":"cache-test","contents":[{"role":"user","parts":[{"text":"shared prefix"}]}],"expireTime":"`+expiry.Format(time.RFC3339)+`"}`), time.Now())
+			require.NoError(t, err)
+			cached, err := CreateManagedGeminiCachedContent(ctx, &channel, "test-upstream-key", "default", request, 1000)
+			wantCacheCharge, wantReservations := 500, 2
+			if tc.insufficient {
+				var apiErr *types.NewAPIError
+				require.ErrorAs(t, err, &apiErr)
+				assert.Equal(t, types.ErrorCodeInsufficientUserQuota, apiErr.GetErrorCode())
+				assert.Nil(t, cached)
+				assert.Zero(t, createCalls.Load(), "insufficient cache funds must not create an upstream resource")
+				wantCacheCharge, wantReservations = 0, 1
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, cached)
+				assert.Equal(t, int32(1), createCalls.Load())
+				persisted, err := model.GetGeminiCachedContent(user.Id, token.Id, cached.PublicID)
+				require.NoError(t, err)
+				assert.Equal(t, "cachedContents/automatic", persisted.UpstreamName)
+			}
+			assert.Same(t, generationBilling, generation.Billing)
+			assert.Equal(t, 200, generation.Billing.GetPreConsumedQuota())
+			assert.Equal(t, generation.RequestId, ctx.GetString(common.RequestIdKey))
+			assert.True(t, ctx.GetBool(string(constant.ContextKeyIsStream)), "cache bookkeeping must not disable the original stream")
+			if tc.subscription {
+				var reservations []model.SubscriptionPreConsumeRecord
+				require.NoError(t, db.Where("user_id = ?", user.Id).Find(&reservations).Error)
+				require.Len(t, reservations, wantReservations)
+				amounts := make(map[string]int64)
+				for _, reservation := range reservations {
+					amounts[reservation.RequestId] = reservation.PreConsumed
+					assert.Equal(t, "consumed", reservation.Status)
+				}
+				assert.Equal(t, int64(200), amounts[generation.RequestId])
+				if cached != nil {
+					assert.Equal(t, int64(500), amounts["gemini-cache-"+cached.PublicID])
+				}
+			}
+			var reservedToken model.Token
+			require.NoError(t, db.First(&reservedToken, token.Id).Error)
+			assert.Equal(t, 10000-200-wantCacheCharge, reservedToken.RemainQuota)
+			PostTextConsumeQuota(ctx, generation, &dto.Usage{PromptTokens: 300, TotalTokens: 300}, nil)
+			require.NoError(t, generation.Billing.Settle(150), "generation settlement remains idempotent")
+			var actualUser model.User
+			var actualToken model.Token
+			require.NoError(t, db.First(&actualUser, user.Id).Error)
+			require.NoError(t, db.First(&actualToken, token.Id).Error)
+			wantTotal := 150 + wantCacheCharge
+			assert.Equal(t, 10000-wantTotal, actualToken.RemainQuota)
+			if tc.subscription {
+				require.NoError(t, db.First(&subscription, subscription.Id).Error)
+				assert.Equal(t, int64(wantTotal), subscription.AmountUsed)
+				assert.Equal(t, balance, actualUser.Quota)
+			} else {
+				assert.Equal(t, balance-wantTotal, actualUser.Quota)
+			}
+			var logs []model.Log
+			require.NoError(t, db.Where("user_id = ?", user.Id).Order("id").Find(&logs).Error)
+			require.Len(t, logs, wantReservations)
+			assert.Equal(t, "cache-test", logs[len(logs)-1].ModelName)
+			assert.Equal(t, 150, logs[len(logs)-1].Quota)
+			assert.True(t, logs[len(logs)-1].IsStream)
+			if !tc.insufficient {
+				assert.Equal(t, "cache-test-cache-create", logs[0].ModelName)
+				assert.Equal(t, 500, logs[0].Quota)
 			}
 		})
 	}

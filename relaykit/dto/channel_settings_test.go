@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -723,6 +724,39 @@ func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
 	err = (&ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
+}
+
+func TestChannelSettingsValidateGeminiAutoCache(t *testing.T) {
+	require.NoError(t, (*ChannelSettings)(nil).ValidateGeminiAutoCache())
+	for _, tc := range []struct {
+		name, raw, invalidField string
+	}{
+		{"omitted", `{}`, ""},
+		{"enabled defaults", `{"gemini_auto_cache_enabled":true}`, ""},
+		{"null defaults", `{"gemini_auto_cache_min_tokens":null,"gemini_auto_cache_ttl_seconds":null}`, ""},
+		{"minimum values", `{"gemini_auto_cache_min_tokens":1,"gemini_auto_cache_ttl_seconds":60}`, ""},
+		{"maximum values", `{"gemini_auto_cache_min_tokens":2000000,"gemini_auto_cache_ttl_seconds":86400}`, ""},
+		{"zero tokens", `{"gemini_auto_cache_min_tokens":0}`, "gemini_auto_cache_min_tokens"},
+		{"negative tokens", `{"gemini_auto_cache_min_tokens":-1}`, "gemini_auto_cache_min_tokens"},
+		{"excessive tokens", `{"gemini_auto_cache_min_tokens":2000001}`, "gemini_auto_cache_min_tokens"},
+		{"zero TTL", `{"gemini_auto_cache_ttl_seconds":0}`, "gemini_auto_cache_ttl_seconds"},
+		{"negative TTL", `{"gemini_auto_cache_ttl_seconds":-1}`, "gemini_auto_cache_ttl_seconds"},
+		{"short TTL", `{"gemini_auto_cache_ttl_seconds":59}`, "gemini_auto_cache_ttl_seconds"},
+		{"excessive TTL", `{"gemini_auto_cache_ttl_seconds":86401}`, "gemini_auto_cache_ttl_seconds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var settings ChannelSettings
+			require.NoError(t, kitutil.Unmarshal([]byte(tc.raw), &settings))
+			err := settings.ValidateGeminiAutoCache()
+			if tc.invalidField != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.invalidField)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.name == "enabled defaults", settings.GeminiAutoCacheEnabled)
+		})
+	}
 }
 
 func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {

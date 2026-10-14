@@ -157,7 +157,8 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 
 	var httpResp *http.Response
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, responseAdaptor, err := doRequestWithGeminiAutoCache(c, info, adaptor, requestBody)
+	adaptor = responseAdaptor
 	if err != nil {
 		if managedCache {
 			return types.NewErrorWithStatusCode(errors.New(service.LocalizeGeminiCacheError(c, "Cached content request could not be completed")), types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())

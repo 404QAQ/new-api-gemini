@@ -205,6 +205,279 @@ func TestGeminiCacheLifecycle(t *testing.T) {
 	}
 }
 
+func TestGeminiAutoCacheLifecycle(t *testing.T) {
+	for _, providerType := range []int{constant.ChannelTypeGemini, constant.ChannelTypeVertexAi, constant.ChannelTypeNewAPI, constant.ChannelTypeOpenAI, constant.ChannelTypeAdvancedCustom} {
+		t.Run(fmt.Sprint(providerType), func(t *testing.T) { testGeminiAutoCacheLifecycle(t, providerType) })
+	}
+}
+
+func testGeminiAutoCacheLifecycle(t *testing.T, providerType int) {
+	require.NoError(t, i18n.Init())
+	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.GeminiCachedContent{}, &model.GeminiAutoCacheSlot{}, &model.Log{}))
+	previousMemory, previousBatch, previousLogs := common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
+	common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousMemory, previousBatch, previousLogs
+	})
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousSettings := *settings
+	t.Cleanup(func() { *settings = previousSettings })
+	t.Cleanup(func() {
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond)
+	})
+	settings.BillingMode = map[string]string{"gemini-2.5-flash": billing_setting.BillingModeTieredExpr, "gemini-2.5-flash-cache-create": billing_setting.BillingModeTieredExpr}
+	settings.BillingExpr = map[string]string{"gemini-2.5-flash": `tier("generation",p*0.3+c*2.5+cr*0.03)`, "gemini-2.5-flash-cache-create": `tier("cache",p*0.3+p*(param("cache_storage_hours")??0))`}
+	service.InitHttpClient()
+	key := "auto-upstream-key"
+	collection := "/v1beta/cachedContents"
+	resourcePrefix, resourceModel := "cachedContents/", "models/gemini-2.5-flash"
+	if providerType == constant.ChannelTypeVertexAi {
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		credentials := service.VertexCredentials{ProjectID: "auto-project", ClientEmail: "auto@example.invalid", PrivateKey: string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}))}
+		encoded, err := common.Marshal(credentials)
+		require.NoError(t, err)
+		key = string(encoded)
+		_, err = service.VertexAccessToken(context.Background(), credentials, &http.Client{Transport: geminiCacheTokenTransport{}})
+		require.NoError(t, err)
+		collection = "/v1/projects/auto-project/locations/us-central1/cachedContents"
+		resourcePrefix, resourceModel = "projects/auto-project/locations/us-central1/cachedContents/", "projects/auto-project/locations/us-central1/publishers/google/models/gemini-2.5-flash"
+	}
+	var mu sync.Mutex
+	creates, counts, reads, plain := 0, 0, 0, 0
+	countTokens, createStatus, referenceStatus := 5000, 200, 200
+	var fullFallback string
+	resources := map[string]map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		raw, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		var body map[string]any
+		require.NoError(t, common.Unmarshal(raw, &body))
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":countTokens"):
+			counts++
+			_, _ = fmt.Fprintf(w, `{"totalTokens":%d}`, countTokens)
+			return
+		case r.URL.Path == collection:
+			creates++
+			if createStatus != http.StatusOK {
+				w.WriteHeader(createStatus)
+				_, _ = w.Write([]byte(`{"error":{"status":"INVALID_ARGUMENT","message":"cache unsupported"}}`))
+				return
+			}
+			assert.NotContains(t, string(raw), "current question")
+			assert.Contains(t, body, "systemInstruction")
+			assert.Contains(t, body, "contents")
+			name := fmt.Sprintf("%sauto-%d", resourcePrefix, creates)
+			resources[name] = body
+			response, err := common.Marshal(map[string]any{"name": name, "model": resourceModel, "expireTime": body["expireTime"], "usageMetadata": map[string]any{"totalTokenCount": 5000}})
+			require.NoError(t, err)
+			_, _ = w.Write(response)
+			return
+		}
+		cached := body["cachedContent"] != nil
+		if cached {
+			reads++
+			assert.Contains(t, resources, body["cachedContent"])
+			assert.NotContains(t, body, "systemInstruction")
+			assert.NotContains(t, body, "tools")
+			assert.NotContains(t, body, "toolConfig")
+			assert.NotContains(t, string(raw), "stable past")
+			if referenceStatus != http.StatusOK {
+				w.WriteHeader(referenceStatus)
+				_, _ = w.Write([]byte(`{"error":{"status":"NOT_FOUND","message":"CachedContent not found"}}`))
+				return
+			}
+		} else {
+			plain++
+			fullFallback = string(raw)
+		}
+		if strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			response := `{"id":"auto","object":"chat.completion","model":"gemini-2.5-flash","choices":[{"index":0,"message":{"role":"assistant","content":"automatic answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5010,"completion_tokens":3,"total_tokens":5013}}`
+			_, _ = w.Write([]byte(response))
+			return
+		}
+		cacheUsage := 0
+		if cached {
+			cacheUsage = 5000
+		}
+		response := fmt.Sprintf(`{"candidates":[{"content":{"role":"model","parts":[{"text":"automatic answer"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":5010,"candidatesTokenCount":3,"totalTokenCount":5013,"cachedContentTokenCount":%d}}`, cacheUsage)
+		if strings.HasSuffix(r.URL.Path, ":streamGenerateContent") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", response)
+		} else {
+			_, _ = w.Write([]byte(response))
+		}
+	}))
+	defer server.Close()
+	user := model.User{Username: "auto-cache", AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000000, Setting: `{"billing_preference":"wallet_only"}`}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "autocachetoken", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000, Group: "default"}
+	require.NoError(t, model.DB.Create(&token).Error)
+	otherToken := token
+	otherToken.Id, otherToken.Key = 0, "autocacheothertoken"
+	require.NoError(t, model.DB.Create(&otherToken).Error)
+	channel := model.Channel{Type: providerType, Status: common.ChannelStatusEnabled, Key: key, Name: "auto cache", Models: "gemini-2.5-flash", Group: "default", BaseURL: &server.URL,
+		Setting: common.GetPointer(`{"gemini_explicit_cache_enabled":true,"gemini_auto_cache_enabled":true}`)}
+	if providerType == constant.ChannelTypeVertexAi {
+		channel.Other = "us-central1"
+	}
+	if providerType == constant.ChannelTypeAdvancedCustom {
+		var routes []dto.AdvancedCustomRoute
+		routes = append(routes, dto.AdvancedCustomRoute{IncomingPath: "/v1/chat/completions", UpstreamPath: "/v1/chat/completions"})
+		for _, action := range []string{"generateContent", "streamGenerateContent"} {
+			path := "/v1beta/models/{model}:" + action
+			routes = append(routes, dto.AdvancedCustomRoute{IncomingPath: path, UpstreamPath: path})
+		}
+		channel.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: routes}})
+	}
+	require.NoError(t, channel.Insert())
+	engine := gin.New()
+	SetRelayRouter(engine)
+	doRequest := func(path, body, tokenKey string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+tokenKey)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		mu.Lock()
+		mu.Unlock()
+		return response
+	}
+	native := `{"systemInstruction":{"parts":[{"text":"native stable system"}]},"generationConfig":{"temperature":0},"contents":[{"role":"user","parts":[{"text":"stable past"}]},{"role":"model","parts":[{"text":"stable answer"}]},{"role":"user","parts":[{"text":"current question"}]}]}`
+	chat := `{"model":"gemini-2.5-flash","temperature":0,"messages":[{"role":"system","content":"chat stable system"},{"role":"user","content":"stable past"},{"role":"assistant","content":"stable answer"},{"role":"user","content":"current question"}]}`
+	for _, protocol := range []string{"native", "chat"} {
+		body, path := native, "/v1beta/models/gemini-2.5-flash:generateContent"
+		if protocol == "chat" {
+			body, path = chat, "/v1/chat/completions"
+		}
+		before := creates
+		response := doRequest(path, body, token.Key)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "automatic answer")
+		require.Equal(t, before+1, creates, protocol+" should create on first eligible request")
+		if protocol == "native" {
+			body = strings.Replace(body, `{"role":"user","parts":[{"text":"current question"}]}`, `{"role":"user","parts":[{"text":"current question"}]},{"role":"model","parts":[{"text":"later answer"}]},{"role":"user","parts":[{"text":"next question"}]}`, 1)
+			path = "/v1beta/models/gemini-2.5-flash:streamGenerateContent"
+		} else {
+			body = strings.Replace(body, `{"role":"user","content":"current question"}`, `{"role":"user","content":"current question"},{"role":"assistant","content":"later answer"},{"role":"user","content":"next question"}`, 1)
+			body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+		}
+		response = doRequest(path, body, token.Key)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "automatic answer")
+		assert.Contains(t, response.Body.String(), "data:")
+		assert.Equal(t, before+1, creates, "growing conversation must reuse its earlier prefix")
+	}
+	assert.Equal(t, 2, counts)
+	assert.Equal(t, 4, reads)
+	assert.Zero(t, plain)
+	response := doRequest("/v1/chat/completions", chat, otherToken.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 3, creates, "another token must create a separate cache")
+
+	// Definite reference rejection retries the complete original body once,
+	// even when the ordinary channel speaks OpenAI and cached transport Gemini.
+	referenceStatus = 404
+	beforeRead, beforePlain := reads, plain
+	response = doRequest("/v1/chat/completions", chat, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, beforeRead+1, reads)
+	assert.Equal(t, beforePlain+1, plain)
+	assert.Contains(t, fullFallback, "chat stable system")
+	assert.Contains(t, fullFallback, "stable past")
+	assert.Contains(t, fullFallback, "current question")
+	referenceStatus = 200
+	response = doRequest("/v1/chat/completions", chat, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, 3, creates, "invalidated resources have a cooldown")
+
+	// A new prefix without prices, below the threshold, or rejected/uncertain
+	// at creation must still send the complete original generation request.
+	for _, scenario := range []string{"missing-price", "too-short", "rejected", "uncertain", "disabled"} {
+		beforeCreate, beforeCount := creates, counts
+		body := strings.Replace(chat, "chat stable system", scenario+" system", 1)
+		price := settings.BillingExpr["gemini-2.5-flash-cache-create"]
+		switch scenario {
+		case "missing-price":
+			delete(settings.BillingExpr, "gemini-2.5-flash-cache-create")
+		case "too-short":
+			countTokens = 12
+		case "rejected":
+			createStatus = 400
+		case "uncertain":
+			createStatus = 503
+		case "disabled":
+			channel.Setting = common.GetPointer(`{"gemini_explicit_cache_enabled":true}`)
+			require.NoError(t, model.DB.Save(&channel).Error)
+		}
+		for range 2 {
+			response = doRequest("/v1/chat/completions", body, token.Key)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, fullFallback, scenario+" system")
+			assert.Contains(t, fullFallback, "stable past")
+		}
+		switch scenario {
+		case "missing-price", "disabled":
+			assert.Equal(t, beforeCount, counts)
+			assert.Equal(t, beforeCreate, creates)
+		case "too-short":
+			assert.Equal(t, beforeCount+1, counts)
+			assert.Equal(t, beforeCreate, creates)
+		default:
+			assert.Equal(t, beforeCreate+1, creates, "failed or uncertain creation cannot repeat immediately")
+		}
+		settings.BillingExpr["gemini-2.5-flash-cache-create"] = price
+		countTokens, createStatus = 5000, 200
+		channel.Setting = common.GetPointer(`{"gemini_explicit_cache_enabled":true,"gemini_auto_cache_enabled":true}`)
+		require.NoError(t, model.DB.Save(&channel).Error)
+	}
+	var pending int64
+	require.NoError(t, model.DB.Model(&model.GeminiCachedContent{}).Where("state = ?", model.GeminiCachedContentPending).Count(&pending).Error)
+	assert.EqualValues(t, 1, pending, "ambiguous upstream creation retains its reservation and pending record")
+	var logs []model.Log
+	require.Eventually(t, func() bool {
+		_ = model.LOG_DB.Where("user_id = ? AND model_name = ? AND type = ?", user.Id, "gemini-2.5-flash-cache-create", model.LogTypeConsume).Find(&logs).Error
+		return len(logs) == 3
+	}, 5*time.Second, time.Millisecond)
+	// Expiration does not silently renew storage. The next request creates a
+	// new paid prefix after both the resource and its published slot expire.
+	require.NoError(t, model.DB.Model(&model.GeminiCachedContent{}).Where("token_id = ? AND state = ?", token.Id, model.GeminiCachedContentActive).Update("expires_at", time.Now().Unix()-1).Error)
+	require.NoError(t, model.DB.Model(&model.GeminiAutoCacheSlot{}).Where("public_id <> ?", "").Update("hold_until", time.Now().Unix()-1).Error)
+	beforeCreates := creates
+	response = doRequest("/v1beta/models/gemini-2.5-flash:generateContent", native, token.Key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, beforeCreates+1, creates)
+
+	// Concurrent cold requests share a database claim; losers can immediately
+	// continue with normal generation while one winner pays for creation.
+	sqlDB, err := model.DB.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	beforeCreates = creates
+	concurrentBody := strings.Replace(chat, "chat stable system", "concurrent stable system", 1)
+	responses := make(chan *httptest.ResponseRecorder, 4)
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Go(func() { responses <- doRequest("/v1/chat/completions", concurrentBody, token.Key) })
+	}
+	workers.Wait()
+	close(responses)
+	for result := range responses {
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+	}
+	mu.Lock()
+	assert.Equal(t, beforeCreates+1, creates, "concurrent requests must pay for only one cache")
+	mu.Unlock()
+}
+
 type geminiCacheTokenTransport struct{}
 
 func (geminiCacheTokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {

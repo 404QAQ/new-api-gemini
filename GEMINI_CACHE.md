@@ -1,6 +1,6 @@
-# new-api Gemini 显式缓存版
+# new-api Gemini 自动与显式缓存版
 
-本分支增加 Gemini 缓存的创建、查询、列表、续期和删除，并支持在原生 `generateContent` / `streamGenerateContent` 和 OpenAI `/v1/chat/completions` 请求中引用缓存。缓存归属、固定渠道与密钥、创建和存储计费由 new-api 管理。
+本分支增加 Gemini 缓存的创建、查询、列表、续期和删除，并支持在原生 `generateContent` / `streamGenerateContent` 和 OpenAI `/v1/chat/completions` 请求中引用缓存。`gemini-cache.3` 增加按渠道开启的自动创建与复用：客户端照常发送完整对话，网关管理缓存前缀。缓存归属、固定渠道与密钥、创建和存储计费由 new-api 管理。
 
 截至 2026-10-14，本地验证使用模拟上游；尚未用真实 Google API 验证，也未部署。
 
@@ -25,7 +25,7 @@ git clone https://github.com/404QAQ/new-api-gemini.git
 cd new-api-gemini
 (cd web && bun install --frozen-lockfile && bun run build:check)
 GOWORK=off go build -trimpath \
-  -ldflags '-X github.com/QuantumNous/new-api/common.Version=v1.0.0-rc.44-gemini-cache.2' \
+  -ldflags '-X github.com/QuantumNous/new-api/common.Version=v1.0.0-rc.44-gemini-cache.3' \
   -o new-api .
 ./new-api --port 3000
 ```
@@ -72,6 +72,53 @@ AdvancedCustom 仅接受匹配当前模型的标准原生生成与流式路由�
 这两个计费名只用于计价，不要加入渠道模型列表或令牌模型权限。模型映射不改变计费名：以客户端请求名添加后缀。创建费用包含创建输入和本次有效期内的存储费用；续期只收取超过已付费截止时间的部分。缩短有效期或提前删除不退还已付费存储。缺价会拒绝请求；免费也必须显式配置零价表达式。
 
 `p` 取上游实际缓存 token 数；`cache_storage_hours`、`cache_storage_seconds` 和 `cache_operation` 由服务端构造。创建前先用上游 `countTokens` 预扣，创建成功后按返回数量校正。后续生成仍使用正常模型的生成与缓存读取计费配置。
+
+## 普通聊天自动创建缓存
+
+自动模式默认关闭。先完成上面的渠道能力和缓存创建价格配置，再通过现有渠道管理 API 合并以下字段到渠道 `setting` JSON（这个 API 字段本身是 JSON 字符串）：
+
+```json
+{
+  "gemini_explicit_cache_enabled": true,
+  "gemini_auto_cache_enabled": true,
+  "gemini_auto_cache_min_tokens": 4096,
+  "gemini_auto_cache_ttl_seconds": 300
+}
+```
+
+后两项可省略，默认分别为 **4096 token、300 秒**。最小 token 配置范围为 1–2,000,000，TTL 为 60–86,400 秒；这只是网关策略，上游仍执行自己的模型门槛。官方 Gemini 直连和受支持的 Vertex 渠道不要求 `gemini_explicit_cache_enabled`，第三方地址仍需要它声明原生缓存能力。关闭 `gemini_auto_cache_enabled` 即停止自动创建和使用，已创建资源按其到期时间结束存储，也可以通过显式接口管理。
+
+客户端无需传缓存字段，也无需调用创建接口。下面的请求在稳定历史达到配置门槛时，自动缓存 system 和前两条历史消息，保留最后一个问题用于生成；`stream` 为 `false` 时同样适用：
+
+```json
+{
+  "model": "gemini-2.5-flash",
+  "stream": true,
+  "messages": [
+    {"role": "system", "content": "固定的系统指令"},
+    {"role": "user", "content": "较长的材料或上一轮问题（此示例本身未达到缓存门槛）"},
+    {"role": "assistant", "content": "上一轮回答"},
+    {"role": "user", "content": "根据这些材料继续回答"}
+  ]
+}
+```
+
+具体行为：
+
+- 缓存完整 system、tools、toolConfig 和历史消息前缀，只在真实用户轮次前切分；工具返回与对应调用保留在同一段，图片内容和思考签名不会被截断。首次只有一个用户问题且没有可缓存 system 时，正常生成。
+- 先查找最长的已有匹配前缀。对话新增消息后仍可复用旧前缀，不因每轮历史增长而新建缓存。命中时不自动续期；过期后按新请求重新创建、重新计费。
+- 按用户、令牌、实际分组、渠道、当前上游 key 指纹、端点和模型隔离。多 Key 轮询渠道按各自账号分别缓存，不能跨 Key 引用。
+- 同一个完整前缀在多个网关进程之间通过数据库竞争，只由一个请求创建；其他并发请求可先正常生成。两个同时首次出现、长度不同的前缀可能分别创建，不保证整个会话只有一个缓存。
+- 首次创建会增加计数和创建接口的等待时间。创建与存储费用单独记账；生成费用仍按真实上游 usage 结算。普通生成按完整输入预扣，不能用尚未创建的缓存提前减少预扣。订阅的缓存创建和生成使用独立的预留 ID。
+- 自动生成的资源同样能通过 `/v1beta/cachedContents` 查询和管理，displayName 为 `new-api automatic cache`。数据库只保存摘要、绑定、过期时间和计费元数据，不保存提示词正文。
+
+以下情况直接按原请求生成：关闭自动模式、短前缀、缺少缓存创建价格、创建额度不足、不支持缓存的渠道或模型、透传模式、Chat→Responses 路由、系统提示词/参数/请求头覆盖、已经显式引用缓存的请求，以及超出 32 MiB 或 256 条 contents 的候选请求。已有显式引用继续遵守它自己的权限和错误规则。
+
+Gemini/Vertex 的原生生成转换可处理已支持的图文及工具内容。对于平时走 OpenAI 协议的中转，自动模式仅在请求可以保留语义地转换时生效；`n`、logprobs、penalty、未知扩展、多模态 Chat 内容等会保留原路径。AdvancedCustom 还必须具备当前客户端入口对应的正常路由，例如普通 Chat 请求需要 `/v1/chat/completions`，仅配置 Gemini 原生路由不够。原生 `fileData` 外部文件 URI 可能指向被覆盖的内容，因此自动模式跳过这类请求；需要固定文件快照时可显式创建缓存。
+
+创建明确失败会进入短暂冷却。上游明确报告缓存过期或不存在时，网关使用完整原请求在同渠道回退一次；网络结果不明、5xx、HTTP 200 后读取/解析失败或已开始输出的流不会因此重新生成。创建结果或扣费状态不确定时，沿用预留额度和待对账记录，并保留自动创建占用，避免立即再次付费创建。过期一天以上的未发布占用会按小批次清理；已发布资源的元数据继续保留。
+
+自动模式不保证每次节省费用，短时间内复用长前缀才可能抵消创建和存储成本。它不会让仅支持 Chat 的中转获得真实 Gemini 缓存，也不会开放本版本未支持的 Vertex Express/global。Google 当前文档说明 Gemini 4 Argon 及后续模型不支持显式缓存，它们继续使用上游的隐式缓存；本功能面向支持 `cachedContents` 的模型。依据：[generateContent 缓存文档](https://ai.google.dev/gemini-api/docs/generate-content/caching)（2026-10-14 核对）。
 
 ## API 示例
 
@@ -139,7 +186,7 @@ curl --fail-with-body -sS "$NEW_API_BASE/v1/chat/completions" \
 - 引用缓存时不能同时发送 `systemInstruction`、`tools` 或 `toolConfig`；这些配置应在创建时确定。托管缓存引用支持原生 Gemini 和 OpenAI Chat 的普通/流式生成，未扩展 Anthropic、Responses 或客户端缓存 `countTokens`。渠道或全局的请求体透传、Chat→Responses 设置不能绕过托管缓存的原生转换与最终校验。
 - Vertex 通过本地缓存接口创建时，对客户端仍返回不透明的 `cachedContents/...` 名称，服务端转换为真实项目区域资源名。原生入口直接传入外部 Vertex 完整资源名仍保留既有路由行为，但不由本功能负责创建管理或存储计费。
 - 原生入口在 NewAPI、AdvancedCustom 等其他类型渠道保留外部缓存引用；这些引用不会分配给 Gemini API Key 渠道。若资源名在本地缓存表存在，无论状态或归属如何，均必须通过本地权限校验，不能回退为外部引用。OpenAI Chat 入口只接受当前令牌创建的本地托管缓存。
-- 不自动提取公共前缀创建缓存，不做隐式缓存管理、自动续期或跨令牌共享。
+- 自动前缀管理须按渠道开启，见上文；不管理 Google 隐式缓存，不做自动续期或跨令牌共享。
 
 ## 失败处理与验证边界
 
@@ -148,6 +195,18 @@ curl --fail-with-body -sS "$NEW_API_BASE/v1/chat/completions" \
 当前没有自动对账任务，也不提供严格的跨进程崩溃恢复或请求幂等保证。遇到上述日志或长期停留在 pending/mutating 状态的记录，应由管理员核对上游资源、额度预留及消费日志；不要直接解锁记录、反复创建或自行退款。
 
 已完成的验证包括模拟上游生命周期、流式/非流式引用、权限隔离、固定密钥、计费及补偿路径，以及真实 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 16.13 的专项验证。该结果不代表已通过真实 Google API 或全部最低数据库版本验证。生产使用前仍需用独立测试账户核实真实上游的请求格式、可缓存模型、计费结果及异常补偿。
+
+自动模式另覆盖五类 provider 的原生/OpenAI Chat 普通和流式生成、历史增长复用、同前缀并发去重、过期重建、其他令牌隔离、缺价/短前缀/拒绝/不确定创建回退、转换有损跳过和响应失败禁止重试。数据库验证包括从 `gemini-cache.2` 的已有缓存表升级、重复迁移不改变现有数据、创建竞争和清理，以及钱包/订阅的缓存与生成独立扣费。
+
+`gemini-cache.3` 验证命令如下。三库专项使用本地隔离测试库：模型测试读取 `TEST_MYSQL_DSN` / `TEST_POSTGRES_DSN`，计费测试读取 `TEST_FIXED_MYSQL_DSN` / `TEST_FIXED_POSTGRES_DSN`。版本为 SQLite 3.50.4、MySQL 8.0.46、PostgreSQL 16.13；未配置这些环境变量时外部数据库用例会跳过，不能将跳过视为通过。
+
+```sh
+go test ./...
+go vet ./...
+go test -race ./router ./relay ./service -run 'TestGeminiAutoCache' -count=1
+go test -v -race ./model ./service -run 'TestGeminiCachedContentDatabase|TestGeminiAutoCacheSlotValidation|TestGeminiCacheBillingDatabaseMatrix' -count=1
+(cd relaykit && GOWORK=off go build ./... && GOWORK=off go test ./dto -run 'TestChannelSettingsValidateGeminiAutoCache' -count=1)
+```
 
 ## 本次扩展的协议依据
 

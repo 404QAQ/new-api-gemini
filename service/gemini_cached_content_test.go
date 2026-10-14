@@ -44,6 +44,57 @@ func TestGeminiCacheErrorLocalization(t *testing.T) {
 	}
 }
 
+func TestGeminiAutoCachePrefixesPreserveConversation(t *testing.T) {
+	body := []byte(`{"systemInstruction":{"parts":[{"text":"stable instructions"}]},"tools":[{"functionDeclarations":[{"name":"lookup"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"generationConfig":{"temperature":0},"contents":[{"role":"user","parts":[{"text":"earlier question"}]},{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"answer":"found"}}}]},{"role":"model","parts":[{"text":"previous answer","thoughtSignature":"signature"}]},{"role":"user","parts":[{"text":"new question"}]}]}`)
+	fields, contents, prefixes, err := geminiAutoCachePrefixes(body, []byte("scope"))
+	require.NoError(t, err)
+	require.Len(t, prefixes, 2, "tool responses must remain with their function call")
+	assert.Equal(t, 0, prefixes[0].Length)
+	assert.Equal(t, 4, prefixes[1].Length)
+	create, err := geminiAutoCacheCreateRequest(fields, contents, 4, "gemini-2.5-flash", 300)
+	require.NoError(t, err)
+	assert.Contains(t, string(create.Body["contents"]), "signature")
+	assert.NotContains(t, string(create.Body["contents"]), "new question")
+	assert.NotContains(t, create.Body, "generationConfig")
+	result, err := geminiAutoCacheReferenceBody(fields, contents, 4, "cachedContents/local")
+	require.NoError(t, err)
+	assert.NotContains(t, string(result), "earlier question")
+	assert.NotContains(t, string(result), "systemInstruction")
+	assert.NotContains(t, string(result), "tools")
+	assert.NotContains(t, string(result), "toolConfig")
+	assert.Contains(t, string(result), `"temperature":0`)
+	assert.Contains(t, string(result), "new question")
+	assert.Contains(t, string(body), "earlier question", "preparation must not alter fallback input")
+
+	grown := strings.Replace(string(body), `{"role":"user","parts":[{"text":"new question"}]}`, `{"role":"user","parts":[{"text":"new question"}]},{"role":"model","parts":[{"text":"new answer"}]},{"role":"user","parts":[{"text":"third question"}]}`, 1)
+	_, _, extended, err := geminiAutoCachePrefixes([]byte(grown), []byte("scope"))
+	require.NoError(t, err)
+	require.Len(t, extended, 3)
+	assert.Equal(t, prefixes[1].Key, extended[1].Key, "growing history must reuse the old prefix")
+	for _, changed := range []string{
+		strings.Replace(string(body), "stable instructions", "other instructions", 1),
+		strings.Replace(string(body), "AUTO", "NONE", 1),
+		strings.Replace(string(body), "lookup", "different_tool", 1),
+		strings.Replace(string(body), "earlier question", "other question", 1),
+	} {
+		_, _, other, err := geminiAutoCachePrefixes([]byte(changed), []byte("scope"))
+		require.NoError(t, err)
+		assert.NotEqual(t, prefixes[1].Key, other[len(other)-1].Key)
+	}
+	_, _, otherOwner, err := geminiAutoCachePrefixes(body, []byte("other scope"))
+	require.NoError(t, err)
+	assert.NotEqual(t, prefixes[1].Key, otherOwner[1].Key)
+	for _, unsupported := range []string{
+		`{"contents":[{"role":"user","parts":[{"text":"only a question"}]}]}`,
+		`{"cachedContent":"cachedContents/external","contents":[{"role":"user","parts":[{"text":"question"}]}]}`,
+		`{"systemInstruction":{},"contents":[],"contents":[]}`,
+		`{"systemInstruction":{"parts":[{"text":"system"}]},"contents":[{"role":"user","parts":[{"fileData":{"fileUri":"gs://bucket/mutable.pdf","mimeType":"application/pdf"}}]},{"role":"user","parts":[{"text":"question"}]}]}`,
+	} {
+		_, _, candidates, err := geminiAutoCachePrefixes([]byte(unsupported), []byte("scope"))
+		assert.True(t, err != nil || len(candidates) == 0)
+	}
+}
+
 func TestGeminiCacheRequestValidation(t *testing.T) {
 	now := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
 	valid := `{"model":"models/gemini-2.5-flash","contents":[{"role":"user","parts":[{"text":"hello"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]}],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"OBJECT","properties":{"snake_case":{"type":"STRING"}}}}]}]}`

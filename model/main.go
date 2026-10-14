@@ -343,6 +343,7 @@ func migrateDB() error {
 		&Channel{},
 		&Token{},
 		&GeminiCachedContent{},
+		&GeminiAutoCacheSlot{},
 		&User{},
 		&UserSession{},
 		&AuthFlow{},

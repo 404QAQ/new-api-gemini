@@ -4,19 +4,99 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/copier"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGeminiAutoCacheCandidatePreservesFallbackRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		invalid    bool
+	}{
+		{"normal chat", `{"model":"local-alias","messages":[{"role":"system","content":"system text"},{"role":"user","content":"question"}],"temperature":0,"max_tokens":0}`, false},
+		{"unsupported Gemini option", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"extra_body":{"google":{"thinkingConfig":{}}}}`, true},
+		{"multiple candidates", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"n":2}`, true},
+		{"log probabilities", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"logprobs":true,"top_logprobs":5}`, true},
+		{"penalty", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"presence_penalty":1}`, true},
+		{"parallel tool restriction", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"parallel_tool_calls":false}`, true},
+		{"tool schema strictness", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object"}}}]}`, true},
+		{"unknown content", `{"model":"local-alias","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"YWJj","format":"wav"}}]}]}`, true},
+		{"multimodal tool output", `{"model":"local-alias","messages":[{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"tool result"}]}]}`, true},
+		{"Markdown image with trailing instruction", `{"model":"local-alias","messages":[{"role":"user","content":"before ![](data:image/png;base64,YWJj) keep this instruction"}]}`, true},
+		{"too many stop sequences", `{"model":"local-alias","messages":[{"role":"user","content":"question"}],"stop":["1","2","3","4","5","6"]}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(tc.body))
+			c.Set("request_model", "original-model")
+			request := &dto.GeneralOpenAIRequest{}
+			require.NoError(t, common.UnmarshalJsonStr(tc.body, request))
+			info := &relaycommon.RelayInfo{
+				Request: request, OriginModelName: "local-alias", RelayFormat: types.RelayFormatOpenAI,
+				FinalRequestRelayFormat: types.RelayFormatOpenAI, ReasoningEffort: "original-effort",
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeVertexAi, ChannelId: 7, UpstreamModelName: "models/gemini-2.5-flash"},
+			}
+			before, err := common.Marshal(info.Request)
+			require.NoError(t, err)
+			metaBefore := *info.ChannelMeta
+			encoded, candidate, err := geminiAutoCacheCandidate(c, info, []byte(tc.body))
+			if tc.invalid {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, candidate)
+				var native dto.GeminiChatRequest
+				require.NoError(t, common.Unmarshal(encoded, &native))
+				require.NotNil(t, native.GenerationConfig.Temperature)
+				assert.Zero(t, *native.GenerationConfig.Temperature)
+				require.NotNil(t, native.GenerationConfig.MaxOutputTokens)
+				assert.Zero(t, *native.GenerationConfig.MaxOutputTokens)
+				require.NotNil(t, native.SystemInstructions)
+				assert.Equal(t, "system text", native.SystemInstructions.Parts[0].Text)
+				require.Len(t, native.Contents, 1)
+				assert.Equal(t, "question", native.Contents[0].Parts[0].Text)
+			}
+			after, err := common.Marshal(info.Request)
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+			assert.Equal(t, metaBefore, *info.ChannelMeta)
+			assert.Equal(t, "original-effort", info.ReasoningEffort)
+			assert.Equal(t, "original-model", c.GetString("request_model"))
+			assert.Empty(t, info.ConversionDiagnostics())
+		})
+	}
+}
+
+func TestGeminiAutoCacheResponseFailureNeverRetriesGeneration(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		t.Run(fmt.Sprint(automatic), func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", nil)
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeGemini, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-2.5-flash"}}
+			response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"candidates":`))}
+			adaptor := &geminiCacheAdaptor{automatic: automatic}
+			_, apiErr := adaptor.DoResponse(c, response, info)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, automatic, types.IsSkipRetryError(apiErr))
+		})
+	}
+}
 
 func TestRequestDeepCopyResponses(t *testing.T) {
 	t.Run("nil source", func(t *testing.T) {
